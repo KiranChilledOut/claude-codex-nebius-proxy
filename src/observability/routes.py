@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from src.conversion.request_converter import _get_context_limit
 from src.core.config import config
 from src.core.model_manager import model_manager
+from src.ensemble.approval import approval_store
 from src.observability.store import observability_recorder
 
 router = APIRouter()
@@ -231,3 +232,45 @@ async def observability_context_usage(
         "percent": percentage,
         "model": claude_model or backend,
     }
+
+
+@router.get("/api/observability/ensemble/runs")
+async def ensemble_runs(
+    session_id: Optional[str] = Query(None),
+    session_name: Optional[str] = Query(None),
+    limit: int = Query(120, ge=1, le=500),
+    _: None = Depends(validate_dashboard_api_key),
+):
+    """Ensemble races for a session: per-candidate outputs, verdicts, winner."""
+    return {
+        "mode": config.ensemble_mode,
+        "models": config.ensemble_models,
+        "runs": observability_recorder.fetch_ensemble_runs(
+            session_id=session_id, session_name=session_name, limit=limit
+        ),
+    }
+
+
+@router.get("/api/observability/ensemble/pending")
+async def ensemble_pending(_: None = Depends(validate_dashboard_api_key)):
+    """Races currently held open waiting for the user's choice (approval mode)."""
+    return {"mode": config.ensemble_mode, "pending": approval_store.list_pending()}
+
+
+@router.post("/api/observability/ensemble/choose")
+async def ensemble_choose(
+    payload: dict,
+    _: None = Depends(validate_dashboard_api_key),
+):
+    """Resolve a pending approval: {'request_id': ..., 'candidate_index': N}."""
+    request_id = str(payload.get("request_id") or "")
+    try:
+        candidate_index = int(payload.get("candidate_index"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="candidate_index must be an integer")
+    if not approval_store.choose(request_id, candidate_index):
+        raise HTTPException(
+            status_code=404,
+            detail="No such pending approval (it may have timed out) or invalid candidate",
+        )
+    return {"ok": True, "request_id": request_id, "candidate_index": candidate_index}

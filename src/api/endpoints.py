@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -16,9 +17,12 @@ from src.codex.session import SessionStore
 from src.codex.stream_converter import codex_response_to_sse, convert_openai_sse_to_responses_sse
 from src.codex.tools_compat import parse_codex_tools
 from src.api.optimization_handlers import optimized_response_to_sse, try_local_optimization
+from src.ensemble.approval import approval_store
+from src.ensemble.engine import run_hedge_race
 from src.conversion.request_converter import (
     _count_tokens_text,
     _estimate_prompt_tokens,
+    compute_usage_scale,
     convert_claude_to_openai,
     count_claude_request_tokens,
 )
@@ -27,6 +31,8 @@ from src.conversion.response_converter import (
     claude_response_to_sse,
     convert_openai_streaming_to_claude_with_cancellation,
     convert_openai_to_claude_response,
+    error_type_for_status,
+    scale_usage_for_client,
 )
 from src.core.client import OpenAIClient
 from src.core.config import config
@@ -560,13 +566,31 @@ async def create_message(
         estimated_input_tokens = _estimate_prompt_tokens(
             openai_request.get("messages", []), include_safety_buffer=False
         )
+        # Dynamic context mapping: report usage in the selected Claude model's
+        # window units so Claude Code's native auto-compaction fires when the
+        # backend's real window is filling (observability keeps raw tokens).
+        usage_scale = compute_usage_scale(request.model, backend_model, beta_header)
+
+        # Claude Code's main loop always offers WebSearch, so when Tavily is
+        # configured nearly every real turn carries a search tool. The ensemble
+        # racer must therefore take precedence and run the search loop per
+        # candidate — otherwise racing/approval would only ever see tool-less
+        # housekeeping probes.
+        has_search_tool = server_tools.request_has_search_tool(request)
+        ensemble_active = (
+            config.ensemble_mode in ("hedge", "approval")
+            and len(config.ensemble_models) >= 2
+            and not model_manager.contains_image_content(
+                request.messages, latest_user_only=True
+            )
+        )
 
         # Server-side web search: when a search tool is offered and Tavily is
         # configured, the proxy executes the search itself in a bounded loop and
         # returns the final answer (Claude Code's search can't run behind a
         # non-Anthropic backend). Only engaged when a search tool is present, so
         # all other requests stay on the normal streaming path untouched.
-        if server_tools.request_has_search_tool(request):
+        if has_search_tool and not ensemble_active:
             openai_response = await server_tools.run_search_loop(
                 openai_request, openai_client, request_id
             )
@@ -587,6 +611,132 @@ async def create_message(
                 stop_reason=claude_response.get("stop_reason"),
                 tool_calls=_extract_tool_calls_from_claude_response(claude_response),
             )
+            claude_response["usage"] = scale_usage_for_client(
+                claude_response.get("usage"), usage_scale
+            )
+            if request.stream:
+                return StreamingResponse(
+                    claude_response_to_sse(claude_response),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Headers": "*",
+                    },
+                )
+            return claude_response
+
+        # --- Ensemble hedge racing: run candidates in parallel, emit the winner ---
+        # Image requests stay on the single vision model; everything else races.
+        # Search-tool requests race the full server-side search loop per
+        # candidate so each model gets its own Tavily-grounded answer.
+        if ensemble_active:
+            search_runner = None
+            if has_search_tool:
+
+                async def search_runner(candidate_request, rid):
+                    return await server_tools.run_search_loop(
+                        candidate_request, openai_client, rid
+                    )
+
+            race = await run_hedge_race(
+                openai_request,
+                openai_client,
+                request_id,
+                config.ensemble_models,
+                config.ensemble_mode,
+                runner=search_runner,
+                judge_model=config.ensemble_judge_model or None,
+            )
+
+            def _finalize_race(chosen_by: str) -> dict:
+                """Lock the winner, record observability (raw usage) + the race
+                split, and return the client-ready Claude response."""
+                race.set_winner(race.winner_index, chosen_by)
+                claude_response = convert_openai_to_claude_response(
+                    race.winner.response, request
+                )
+                _record_message_observability(
+                    request_id=request_id,
+                    session_id=session_id,
+                    session_name=session_name,
+                    started_at=started_at,
+                    started_at_unix=started_at_unix,
+                    start_monotonic=start_monotonic,
+                    request=request,
+                    backend_model=race.winner.model,
+                    stream=bool(request.stream),
+                    status="success",
+                    http_status=200,
+                    usage=claude_response.get("usage"),
+                    stop_reason=claude_response.get("stop_reason"),
+                    tool_calls=_extract_tool_calls_from_claude_response(claude_response),
+                )
+                observability_recorder.record_ensemble(
+                    request_id=request_id,
+                    session_id=session_id,
+                    session_name=session_name,
+                    mode=config.ensemble_mode,
+                    candidates=race.candidates,
+                )
+                claude_response["usage"] = scale_usage_for_client(
+                    claude_response.get("usage"), usage_scale
+                )
+                return claude_response
+
+            # Hold only real turns (they offer tools); housekeeping probes
+            # (title generation, quota checks — tool-less, tiny max_tokens)
+            # would otherwise stall Claude Code for the approval timeout.
+            hold_for_approval = (
+                config.ensemble_mode == "approval"
+                and bool(request.stream)
+                and bool(request.tools)
+                and sum(1 for c in race.candidates if c.status != "error") >= 2
+            )
+
+            if hold_for_approval:
+                pending = approval_store.register(
+                    request_id, race, session_id, session_name
+                )
+
+                async def approval_stream():
+                    chosen_by = "timeout"
+                    try:
+                        deadline = time.monotonic() + config.ensemble_approval_timeout
+                        while time.monotonic() < deadline:
+                            remaining = deadline - time.monotonic()
+                            try:
+                                await asyncio.wait_for(
+                                    pending.event.wait(),
+                                    timeout=min(15.0, max(remaining, 0.1)),
+                                )
+                                break
+                            except asyncio.TimeoutError:
+                                # Keep Claude Code's stream alive while the user
+                                # decides on the dashboard.
+                                yield 'event: ping\ndata: {"type": "ping"}\n\n'
+                        if pending.choice is not None:
+                            race.winner_index = pending.choice
+                            chosen_by = "user"
+                    finally:
+                        approval_store.remove(request_id)
+                    claude_response = _finalize_race(chosen_by)
+                    for event in claude_response_to_sse(claude_response):
+                        yield event
+
+                return StreamingResponse(
+                    approval_stream(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Headers": "*",
+                    },
+                )
+
+            claude_response = _finalize_race("auto")
             if request.stream:
                 return StreamingResponse(
                     claude_response_to_sse(claude_response),
@@ -625,6 +775,7 @@ async def create_message(
                             openai_client,
                             request_id,
                             observability_context=stream_metrics,
+                            usage_scale=usage_scale,
                         ):
                             yield event
                         stream_status = stream_metrics.get("status") or "success"
@@ -674,7 +825,10 @@ async def create_message(
                 error_message = openai_client.classify_openai_error(e.detail)
                 error_response = {
                     "type": "error",
-                    "error": {"type": "api_error", "message": error_message},
+                    "error": {
+                        "type": error_type_for_status(e.status_code),
+                        "message": error_message,
+                    },
                 }
                 _record_message_observability(
                     request_id=request_id,
@@ -691,7 +845,11 @@ async def create_message(
                     error_type="HTTPException",
                     error_message=error_message,
                 )
-                return JSONResponse(status_code=e.status_code, content=error_response)
+                return JSONResponse(
+                    status_code=e.status_code,
+                    content=error_response,
+                    headers=getattr(e, "headers", None),
+                )
         else:
             # Non-streaming response
             openai_response = await openai_client.create_chat_completion(openai_request, request_id)
@@ -711,6 +869,9 @@ async def create_message(
                 usage=claude_response.get("usage"),
                 stop_reason=claude_response.get("stop_reason"),
                 tool_calls=_extract_tool_calls_from_claude_response(claude_response),
+            )
+            claude_response["usage"] = scale_usage_for_client(
+                claude_response.get("usage"), usage_scale
             )
             return claude_response
     except HTTPException as e:
@@ -755,7 +916,11 @@ async def create_message(
 
 
 @router.post("/v1/messages/count_tokens")
-async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(validate_api_key)):
+async def count_tokens(
+    request: ClaudeTokenCountRequest,
+    http_request: Request,
+    _: None = Depends(validate_api_key),
+):
     """Anthropic-compatible token-counting endpoint.
 
     Returns {"input_tokens": N} matching the shape Claude Code expects.
@@ -763,9 +928,17 @@ async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(valid
     + every tool definition, including schema-less computer/bash/text_editor
     tools. Tool definitions are the largest part of most Claude Code
     requests — the prior implementation silently omitted them.
+
+    Counts are reported in the selected Claude model's context-window units
+    (same scaling as live usage) so Claude Code's context math is consistent.
     """
     try:
-        return {"input_tokens": count_claude_request_tokens(request)}
+        backend_model = model_manager.map_claude_model_to_openai(request.model)
+        usage_scale = compute_usage_scale(
+            request.model, backend_model, http_request.headers.get("anthropic-beta", "")
+        )
+        raw_count = count_claude_request_tokens(request)
+        return {"input_tokens": int(round(raw_count * usage_scale))}
     except Exception as e:
         logger.error(f"Error counting tokens: {e}")
         raise HTTPException(status_code=500, detail=str(e))

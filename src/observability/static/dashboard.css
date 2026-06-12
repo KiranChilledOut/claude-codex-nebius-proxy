@@ -1206,3 +1206,143 @@ select {
     font-size: 24px;
   }
 }
+
+/* ============================================
+   Ensemble races (hedge + approval mode)
+   ============================================ */
+.approval-banner {
+  position: fixed;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 200;
+  display: flex;
+  gap: 8px;
+}
+.approval-banner-item {
+  background: var(--accent-amber, #d97706);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  animation: ens-pulse 1.6s ease-in-out infinite;
+}
+@keyframes ens-pulse {
+  50% { opacity: 0.75; }
+}
+.ensemble-race {
+  border-top: 1px solid var(--border, #e5e7eb);
+  padding: 12px 0;
+}
+.ensemble-race-head {
+  font-size: 0.85rem;
+  opacity: 0.8;
+  margin-bottom: 8px;
+}
+.ensemble-race--pending .ensemble-race-head {
+  color: var(--accent-amber, #d97706);
+  font-weight: 600;
+  opacity: 1;
+}
+.ensemble-candidates {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+.candidate-card {
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.candidate-card--won {
+  border-color: var(--accent-green, #0f9f6e);
+  box-shadow: 0 0 0 1px var(--accent-green, #0f9f6e);
+}
+.candidate-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  word-break: break-all;
+}
+.candidate-meta {
+  font-size: 0.78rem;
+  opacity: 0.75;
+}
+.ens-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  border-radius: 6px;
+  padding: 2px 7px;
+  white-space: nowrap;
+  margin-left: 4px;
+}
+.ens-badge--won { background: var(--accent-green, #0f9f6e); color: #fff; }
+.ens-badge--lost { background: var(--border, #9ca3af); color: #fff; }
+.ens-badge--error { background: var(--accent-red, #dc2626); color: #fff; }
+.ens-badge--pending { background: var(--accent-amber, #d97706); color: #fff; }
+.ens-badge--auto { background: transparent; color: var(--accent-amber, #d97706); border: 1px solid currentColor; }
+.ens-reasons {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.78rem;
+  opacity: 0.85;
+}
+.ens-tool code {
+  font-weight: 700;
+  font-size: 0.78rem;
+}
+.ens-tool pre,
+.ens-output {
+  margin: 4px 0 0;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--bg-subtle, rgba(127, 127, 127, 0.08));
+  font-size: 0.75rem;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ens-output--error {
+  border: 1px solid var(--accent-red, #dc2626);
+}
+.ens-choose-btn {
+  align-self: flex-start;
+  margin-top: 4px;
+  background: var(--accent-green, #0f9f6e);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.ens-choose-btn:hover { filter: brightness(1.1); }
+.ens-empty {
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+.ens-details summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 600;
+  opacity: 0.85;
+  user-select: none;
+}
+.ens-noout {
+  font-size: 0.78rem;
+  opacity: 0.55;
+  font-style: italic;
+}
+.ens-reason--decision {
+  font-weight: 700;
+  color: var(--accent-green, #0f9f6e);
+}

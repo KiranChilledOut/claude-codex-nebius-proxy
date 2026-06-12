@@ -981,6 +981,25 @@ class DashboardApp {
 
     // Auto refresh every 5s
     setInterval(() => this.refresh().catch(() => {}), 5000);
+
+    // Ensemble approvals: poll fast (the held stream times out otherwise) and
+    // delegate clicks for Choose buttons / banner jumps.
+    this.pollEnsemblePending().catch(() => {});
+    setInterval(() => this.pollEnsemblePending().catch(() => {}), 3000);
+    document.addEventListener("click", (event) => {
+      const chooseBtn = event.target.closest("[data-choose]");
+      if (chooseBtn) {
+        this.chooseEnsembleCandidate(
+          chooseBtn.dataset.requestId,
+          parseInt(chooseBtn.dataset.choose, 10)
+        );
+        return;
+      }
+      const gotoBtn = event.target.closest("[data-goto-session]");
+      if (gotoBtn && gotoBtn.dataset.gotoSession) {
+        this.onSessionSelect(gotoBtn.dataset.gotoSession);
+      }
+    });
   }
 
   toggleSidebar() {
@@ -1026,7 +1045,7 @@ class DashboardApp {
     const title = document.getElementById("sessionTitle");
     if (title) title.textContent = sessionName;
 
-    const [summary, requests, failures, toolCalls, contextUsage] = await Promise.all([
+    const [summary, requests, failures, toolCalls, contextUsage, ensembleRuns] = await Promise.all([
       fetchJson(`/api/observability/sessions/${encodeURIComponent(sessionName)}/summary`).catch(() => null),
       fetchJson(`/api/observability/requests?session_name=${encodeURIComponent(sessionName)}&limit=500`).catch(() => ({ data: [] })),
       fetchJson(`/api/observability/failures?session_name=${encodeURIComponent(sessionName)}&limit=500`).catch(() => ({ data: [] })),
@@ -1034,12 +1053,15 @@ class DashboardApp {
       fetchJson("/api/observability/context-usage", {
         headers: { "x-session-name": sessionName },
       }).catch(() => null),
+      fetchJson(`/api/observability/ensemble/runs?session_name=${encodeURIComponent(sessionName)}&limit=120`).catch(() => ({ runs: [], mode: "off", models: [] })),
     ]);
 
+    this.state.sessionName = sessionName;
     this.state.sessionSummary = summary;
     this.state.sessionRequests = requests.data || [];
     this.state.sessionFailures = failures.data || [];
     this.state.sessionToolCalls = toolCalls.data || [];
+    this.state.ensembleRuns = ensembleRuns;
     this.renderSessionView(contextUsage);
   }
 
@@ -1088,6 +1110,141 @@ class DashboardApp {
     this.renderTableById("sessionRequests");
     this.renderTableById("sessionToolCalls");
     this.renderTableById("sessionFailures");
+
+    // Ensemble race split + any pending approvals for this session
+    this.renderEnsembleRuns();
+    this.renderPendingApprovals();
+  }
+
+  // ===========================
+  // Ensemble (hedge racing + approval mode)
+  // ===========================
+  candidateCardHtml(cand, requestId, { withChoose = false } = {}) {
+    const badge =
+      cand.status === "won"
+        ? `<span class="ens-badge ens-badge--won">WON${cand.chosen_by ? " · " + escapeHtml(cand.chosen_by) : ""}</span>`
+        : cand.status === "error"
+          ? '<span class="ens-badge ens-badge--error">ERROR</span>'
+          : withChoose
+            ? '<span class="ens-badge ens-badge--pending">CANDIDATE</span>'
+            : '<span class="ens-badge ens-badge--lost">LOST</span>';
+    const autoTag = withChoose && cand.auto_winner ? '<span class="ens-badge ens-badge--auto">auto pick</span>' : "";
+    const reasons = (cand.reasons || [])
+      .map((r) => `<li class="${/^(decision:|judge)/.test(r) ? "ens-reason--decision" : ""}">${escapeHtml(r)}</li>`)
+      .join("");
+    const tools = (cand.tool_calls || [])
+      .map((t) => `<div class="ens-tool"><code>${escapeHtml(t.name || "?")}</code><pre>${escapeHtml(t.arguments || "")}</pre></div>`)
+      .join("");
+    const text = cand.output_text
+      ? `<details class="ens-details" ${withChoose ? "open" : ""}>
+           <summary>Output (${cand.output_text.length} chars)</summary>
+           <pre class="ens-output">${escapeHtml(cand.output_text)}</pre>
+         </details>`
+      : (cand.tool_calls || []).length || cand.error
+        ? ""
+        : '<div class="ens-noout">(no text output)</div>';
+    const err = cand.error ? `<pre class="ens-output ens-output--error">${escapeHtml(cand.error)}</pre>` : "";
+    const chooseBtn =
+      withChoose && cand.status !== "error"
+        ? `<button class="ens-choose-btn" data-choose="${cand.index ?? cand.candidate_index ?? 0}" data-request-id="${escapeHtml(requestId)}">Continue with this</button>`
+        : "";
+    const score = cand.score === null || cand.score === undefined ? "—" : Number(cand.score).toFixed(1);
+    const tokens =
+      cand.input_tokens || cand.output_tokens
+        ? ` · ${fmtInt(cand.input_tokens || 0)} in / ${fmtInt(cand.output_tokens || 0)} out`
+        : "";
+    return `<div class="candidate-card ${cand.status === "won" ? "candidate-card--won" : ""}">
+      <div class="candidate-head"><strong>${escapeHtml(cand.model || "?")}</strong><span>${badge}${autoTag}</span></div>
+      <div class="candidate-meta">score ${score} · ${fmtMs(cand.latency_ms)} · ${escapeHtml(cand.finish_reason || "")}${tokens}</div>
+      ${reasons ? `<ul class="ens-reasons">${reasons}</ul>` : ""}
+      ${tools}${text}${err}${chooseBtn}
+    </div>`;
+  }
+
+  renderEnsembleRuns() {
+    const panel = document.getElementById("ensemblePanel");
+    const runsEl = document.getElementById("ensembleRuns");
+    if (!panel || !runsEl) return;
+    const data = this.state.ensembleRuns || { runs: [], mode: "off", models: [] };
+    const hasContent = (data.runs || []).length > 0 || data.mode !== "off";
+    panel.style.display = hasContent ? "" : "none";
+    const badge = document.getElementById("ensembleModeBadge");
+    if (badge) {
+      badge.textContent = `mode: ${data.mode}${(data.models || []).length ? " · " + data.models.join(" vs ") : ""}`;
+    }
+    runsEl.innerHTML =
+      (data.runs || [])
+        .map(
+          (run) => `
+      <div class="ensemble-race">
+        <div class="ensemble-race-head">${fmtTime(run.created_at)} · ${escapeHtml(run.mode || "")} · <code>${escapeHtml((run.request_id || "").slice(0, 8))}</code></div>
+        <div class="ensemble-candidates">${(run.candidates || []).map((c) => this.candidateCardHtml(c, run.request_id)).join("")}</div>
+      </div>`
+        )
+        .join("") || '<p class="ens-empty">No races recorded yet for this session.</p>';
+  }
+
+  async pollEnsemblePending() {
+    const data = await fetchJson("/api/observability/ensemble/pending");
+    this.state.ensemblePending = data.pending || [];
+    this.renderApprovalBanner();
+    this.renderPendingApprovals();
+  }
+
+  renderApprovalBanner() {
+    const banner = document.getElementById("approvalBanner");
+    if (!banner) return;
+    const pending = this.state.ensemblePending || [];
+    if (!pending.length) {
+      banner.style.display = "none";
+      banner.innerHTML = "";
+      return;
+    }
+    banner.style.display = "";
+    banner.innerHTML = pending
+      .map(
+        (p) =>
+          `<button class="approval-banner-item" data-goto-session="${escapeHtml(p.session_name || "")}">&#9203; Approval needed${p.session_name ? " — " + escapeHtml(p.session_name) : ""} (${Math.round(p.waiting_seconds)}s)</button>`
+      )
+      .join("");
+  }
+
+  renderPendingApprovals() {
+    const container = document.getElementById("ensemblePending");
+    if (!container) return;
+    const session = this.state.sessionName;
+    const pending = (this.state.ensemblePending || []).filter(
+      (p) => !session || !p.session_name || p.session_name === session
+    );
+    container.innerHTML = pending
+      .map(
+        (p) => `
+      <div class="ensemble-race ensemble-race--pending">
+        <div class="ensemble-race-head">&#9203; Waiting for your choice — <code>${escapeHtml((p.request_id || "").slice(0, 8))}</code> (${Math.round(p.waiting_seconds)}s elapsed)</div>
+        <div class="ensemble-candidates">${(p.candidates || []).map((c) => this.candidateCardHtml(c, p.request_id, { withChoose: true })).join("")}</div>
+      </div>`
+      )
+      .join("");
+    if (pending.length) {
+      const panel = document.getElementById("ensemblePanel");
+      if (panel) panel.style.display = "";
+    }
+  }
+
+  async chooseEnsembleCandidate(requestId, candidateIndex) {
+    try {
+      await fetchJson("/api/observability/ensemble/choose", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: requestId, candidate_index: candidateIndex }),
+      });
+    } catch (e) {
+      // Pending may have timed out; the next poll clears it.
+    }
+    await this.pollEnsemblePending().catch(() => {});
+    if (this.state.sessionName) {
+      setTimeout(() => this.loadSessionView(this.state.sessionName).catch(() => {}), 1200);
+    }
   }
 
   // ===========================
