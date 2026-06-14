@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.core.config import config
 from src.observability.pricing import PricingCatalog
 from src.observability.store import ObservabilityRecorder, utc_now_iso
 
