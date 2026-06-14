@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Multi-theme selector (5 themes): **Lime** (default, cyberpunk), **Navy & White** (corporate), **Mono** (high-contrast), **Star Wars** (Imperial/Sith), **KTM** (orange/black). Replaced binary light/dark toggle in `dashboard.css`, `dashboard.js`, `dashboard.html`.
+- `/dashboard/health` endpoint — lightweight availability check returning `{"status": "ok", "version": "1.0"}`, useful for load balancers and uptime monitors.
+- `Cache-Control: public, max-age=3600, must-revalidate` headers on dashboard static assets (`/dashboard/assets/*`).
+
+### Quality of Life
+- Dashboard root (`/dashboard`) content-type is now explicitly `text/html; charset=utf-8`.
+
 ### Fixed
 - Streaming responses now report real provider token usage instead of zeros.
   The stream converter exited at `finish_reason` before the trailing

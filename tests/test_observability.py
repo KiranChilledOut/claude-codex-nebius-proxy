@@ -207,6 +207,60 @@ def test_context_usage_for_returns_latest_nonzero_tokens(tmp_path):
     assert result["request_count"] == 3
 
 
+@pytest.fixture
+def client(monkeypatch):
+    """Dashboard test client (auth bypassed)."""
+    from fastapi.testclient import TestClient
+    from src.main import app
+
+    monkeypatch.setattr(config, "ignore_client_api_key", True)
+    return TestClient(app)
+
+
+def test_dashboard_returns_charset_utf8(client):
+    """Dashboard content-type must include charset=utf-8."""
+    response = client.get("/dashboard")
+    assert response.status_code == 200
+    ct = response.headers.get("content-type", "")
+    assert "text/html" in ct
+    assert "charset=utf-8" in ct
+
+
+def test_dashboard_serves_known_assets(client):
+    """CSS and JS assets must be served with correct mime-types and cache headers."""
+    for asset, expected_mime in (
+        ("dashboard.css", "text/css"),
+        ("dashboard.js", "application/javascript"),
+    ):
+        response = client.get(f"/dashboard/assets/{asset}")
+        assert response.status_code == 200
+        ct = response.headers.get("content-type", "")
+        assert expected_mime in ct
+        cc = response.headers.get("Cache-Control", "")
+        assert "max-age=3600" in cc
+        assert "must-revalidate" in cc
+
+
+def test_dashboard_rejects_traversal_attempts(client):
+    """Directory-traversal-like asset names must 404."""
+    for asset in ("../store.py", "foo/../bar", "../../etc/passwd"):
+        response = client.get(f"/dashboard/assets/{asset}")
+        assert response.status_code == 404
+
+
+def test_dashboard_rejects_unknown_assets(client):
+    """Asset names unrelated to existing files must 404."""
+    response = client.get("/dashboard/assets/nonexistent.xyz")
+    assert response.status_code == 404
+
+
+def test_dashboard_health_returns_ok(client):
+    """/dashboard/health must always report availability."""
+    response = client.get("/dashboard/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "version": "1.0"}
+
+
 def test_context_usage_for_returns_none_when_no_rows(tmp_path):
     """_context_usage_for returns None when no matching session."""
     db_path = tmp_path / "observability.sqlite3"

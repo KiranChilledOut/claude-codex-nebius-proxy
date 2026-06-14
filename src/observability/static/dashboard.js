@@ -72,21 +72,20 @@ async function fetchJson(url, options = {}) {
 // ============================================
 class ThemeManager {
   constructor() {
+    this.themes = ["lime", "navy", "mono", "starwars", "ktm"];
     this.theme = this.loadTheme();
     this.apply();
   }
 
   loadTheme() {
     const saved = localStorage.getItem("dashboard-theme");
-    if (saved) return saved;
-    if (window.matchMedia("(prefers-color-scheme: dark)").matches) return "dark";
-    return "light";
+    if (saved && this.themes.includes(saved)) return saved;
+    return "lime";
   }
 
-  toggle() {
-    const target = this.theme === "light" ? "dark" : "light";
-    // Unified cross-fade: fade body slightly while colours swap,
-    // then bring it back. Total perceived time ~300 ms.
+  select(target) {
+    if (!this.themes.includes(target) || target === this.theme) return;
+    // Unified cross-fade: fade body slightly while colours swap
     document.body.style.opacity = "0.6";
     setTimeout(() => {
       this.theme = target;
@@ -99,10 +98,6 @@ class ThemeManager {
 
   apply() {
     document.documentElement.setAttribute("data-theme", this.theme);
-    const sun = document.querySelector(".icon-sun");
-    const moon = document.querySelector(".icon-moon");
-    if (sun) sun.style.display = this.theme === "light" ? "block" : "none";
-    if (moon) moon.style.display = this.theme === "light" ? "none" : "block";
   }
 }
 
@@ -264,8 +259,31 @@ class ChartController {
     this.themeManager = themeManager;
     this.charts = new Map(); // canvas -> { rows, opts }
     this.tooltipEl = null;
+    this._resizeObserver = null;
     this.ensureTooltip();
+    this._setupResizeObserver();
     document.addEventListener("themechange", () => this.redrawAll());
+  }
+
+  _setupResizeObserver() {
+    if (!window.ResizeObserver) return;
+    this._resizeObserver = new ResizeObserver((entries) => {
+      // Debounce: only redraw after 250ms since last resize
+      if (this._resizeDebounce) clearTimeout(this._resizeDebounce);
+      this._resizeDebounce = setTimeout(() => {
+        const resized = new Set(entries.map((e) => e.target));
+        for (const [canvas, { rows, opts }] of this.charts) {
+          if (!canvas.parentNode) {
+            this.charts.delete(canvas);
+            continue;
+          }
+          if (resized.has(canvas.parentElement)) {
+            this.drawSeriesChart(canvas, rows, opts);
+          }
+        }
+        this._resizeDebounce = null;
+      }, 250);
+    });
   }
 
   ensureTooltip() {
@@ -273,7 +291,7 @@ class ChartController {
     this.tooltipEl = document.createElement("div");
     this.tooltipEl.className = "chart-tooltip";
     this.tooltipEl.style.cssText =
-      "position:absolute;pointer-events:none;background:rgba(0,0,0,0.85);color:#fff;font:13px system-ui, -apple-system, sans-serif;padding:6px 10px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.2);z-index:9999;opacity:0;transition:opacity 0.15s;white-space:nowrap;";
+      "position:absolute;pointer-events:none;z-index:9999;opacity:0;transition:opacity 0.2s cubic-bezier(0.4,0,0.2,1);white-space:nowrap;";
     document.body.appendChild(this.tooltipEl);
   }
 
@@ -281,7 +299,8 @@ class ChartController {
     const val = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
     if (val) return val;
     // Fallbacks
-    const isDark = this.themeManager.theme === "dark";
+    const darkThemes = new Set(["lime", "mono", "starwars", "ktm"]);
+    const isDark = darkThemes.has(this.themeManager.theme);
     const fallbacks = {
       "--text-secondary": isDark ? "#94a3b8" : "#647386",
       "--border": isDark ? "#334155" : "#d9e0ea",
@@ -299,6 +318,11 @@ class ChartController {
     this.charts.set(newCanvas, { rows, opts });
     this._attachListeners(newCanvas, rows, opts);
     this.drawSeriesChart(newCanvas, rows, opts);
+
+    // Observe parent container for resize events
+    if (this._resizeObserver && newCanvas.parentElement) {
+      this._resizeObserver.observe(newCanvas.parentElement);
+    }
   }
 
   _attachListeners(canvas, rows, opts) {
@@ -952,6 +976,7 @@ class DashboardApp {
       refreshQueued: false,
     };
     this.animatedMetrics = new Set();
+    this._initTime = performance.now();
     this.init();
   }
 
@@ -961,7 +986,11 @@ class DashboardApp {
     document.getElementById("sidebarBackdrop")?.addEventListener("click", () => this.closeSidebar());
 
     // Theme toggle
-    document.getElementById("themeToggle")?.addEventListener("click", () => this.themeManager.toggle());
+    const themeSelect = document.getElementById("themeSelect");
+    if (themeSelect) {
+      themeSelect.value = this.themeManager.theme;
+      themeSelect.addEventListener("change", (e) => this.themeManager.select(e.target.value));
+    }
 
     // Back button
     document.getElementById("backToGlobal")?.addEventListener("click", () => this.showGlobalView());
@@ -976,8 +1005,14 @@ class DashboardApp {
     // Load sidebar
     this.sessionManager.load();
 
-    // Initial data load
-    this.refresh();
+    // Start live glow pulse for session dots
+    this._startLiveGlow();
+
+    // Initial data load — guarded so the loading screen always resolves
+    this.refresh().catch((err) => {
+      this._showErrorBanner(err.message || "Failed to connect — check that the proxy is running.");
+      this._hideLoadingScreen();
+    });
 
     // Auto refresh every 5s
     setInterval(() => this.refresh().catch(() => {}), 5000);
@@ -1010,6 +1045,60 @@ class DashboardApp {
   closeSidebar() {
     const sidebar = document.getElementById("sidebar");
     sidebar?.classList.remove("sidebar--open");
+  }
+
+  // Smoothly hide the loading screen after first data load
+  // Hide the loading screen, respecting a minimum display time (600 ms)
+  // so the user sees the animation even on very fast loads.
+  _hideLoadingScreen() {
+    const loader = document.getElementById("loadingScreen");
+    if (!loader || loader.style.display === "none") return;
+    const elapsed = performance.now() - (this._initTime || 0);
+    const minDisplay = 600;
+    const delay = Math.max(0, minDisplay - elapsed);
+    setTimeout(() => {
+      loader.style.opacity = "0";
+      setTimeout(() => { loader.style.display = "none"; }, 400);
+    }, delay);
+  }
+
+  // Show a transient error banner to the user
+  _showErrorBanner(message) {
+    const banner = document.getElementById("errorBanner");
+    if (!banner) return;
+    banner.textContent = message;
+    banner.style.display = "";
+    banner.style.opacity = "1";
+    setTimeout(() => {
+      banner.style.opacity = "0";
+      setTimeout(() => { banner.style.display = "none"; }, 400);
+    }, 5000);
+  }
+
+  // Staggered entrance animation for metric cards
+  _animateMetricsIn() {
+    document.querySelectorAll(".metric").forEach((el, index) => {
+      el.style.animation = "none";
+      // Force reflow
+      el.offsetHeight;
+      el.style.opacity = "0";
+      el.style.transform = "translateY(12px)";
+      el.style.transition = `opacity 0.4s ease ${index * 0.05}s, transform 0.4s ease ${index * 0.05}s`;
+      requestAnimationFrame(() => {
+        el.style.opacity = "1";
+        el.style.transform = "translateY(0)";
+      });
+    });
+  }
+
+  // Live glow: periodically toggle a glow class on all live dots
+  _startLiveGlow() {
+    if (this.liveGlowTimer) return;
+    this.liveGlowTimer = setInterval(() => {
+      document.querySelectorAll(".session-live-dot").forEach((dot) => {
+        dot.classList.toggle("live-glow");
+      });
+    }, 1500);
   }
 
   // ===========================
@@ -1101,8 +1190,8 @@ class DashboardApp {
       labelB: "Output",
       valueA: (row) => row.input_tokens || 0,
       valueB: (row) => row.output_tokens || 0,
-      colorA: "#2563eb",
-      colorB: "#0f9f6e",
+      colorA: this.chartController.getThemeColor("--chart-a"),
+      colorB: this.chartController.getThemeColor("--chart-b"),
       formatter: fmtInt,
     });
 
@@ -1146,7 +1235,7 @@ class DashboardApp {
     const err = cand.error ? `<pre class="ens-output ens-output--error">${escapeHtml(cand.error)}</pre>` : "";
     const chooseBtn =
       withChoose && cand.status !== "error"
-        ? `<button class="ens-choose-btn" data-choose="${cand.index ?? cand.candidate_index ?? 0}" data-request-id="${escapeHtml(requestId)}">Continue with this</button>`
+        ? `<button type="button" class="ens-choose-btn" data-choose="${cand.index ?? cand.candidate_index ?? 0}" data-request-id="${escapeHtml(requestId)}">Continue with this</button>`
         : "";
     const score = cand.score === null || cand.score === undefined ? "—" : Number(cand.score).toFixed(1);
     const tokens =
@@ -1204,7 +1293,7 @@ class DashboardApp {
     banner.innerHTML = pending
       .map(
         (p) =>
-          `<button class="approval-banner-item" data-goto-session="${escapeHtml(p.session_name || "")}">&#9203; Approval needed${p.session_name ? " — " + escapeHtml(p.session_name) : ""} (${Math.round(p.waiting_seconds)}s)</button>`
+          `<button type="button" class="approval-banner-item" data-goto-session="${escapeHtml(p.session_name || "")}">&#9203; Approval needed${p.session_name ? " — " + escapeHtml(p.session_name) : ""} (${Math.round(p.waiting_seconds)}s)</button>`
       )
       .join("");
   }
@@ -1272,15 +1361,29 @@ class DashboardApp {
         this.state.toolCalls = toolCalls.data || [];
         this.render();
 
+        // Announce refresh to screen readers
+        const announce = document.getElementById("refreshAnnounce");
+        if (announce) {
+          announce.textContent = `Data refreshed, ${this.state.requests.length} requests loaded`;
+          setTimeout(() => { announce.textContent = ""; }, 3000);
+        }
+
         // Also refresh session list sidebar
         this.sessionManager.load().catch(() => {});
       } while (this.state.refreshQueued);
+    } catch (err) {
+      this._showErrorBanner(
+        `Data refresh failed: ${err.message || "unreachable endpoint — check API key and proxy status"}`
+      );
     } finally {
       this.state.refreshing = false;
     }
   }
 
   render() {
+    // Hide loading screen on first successful render
+    this._hideLoadingScreen();
+
     this.renderSummary();
     this.renderModels();
     this.renderCharts();
@@ -1288,6 +1391,12 @@ class DashboardApp {
     this.renderTableById("requests");
     this.renderTableById("failures");
     this.renderTableById("toolCalls");
+
+    // Animate metrics in with stagger on first render only (not every auto-refresh)
+    if (!this._metricsAnimatedIn) {
+      this._animateMetricsIn();
+      this._metricsAnimatedIn = true;
+    }
   }
 
   renderSummary() {
@@ -1396,19 +1505,21 @@ class DashboardApp {
   }
 
   renderCharts() {
+    const chartA = this.chartController.getThemeColor("--chart-a");
+    const chartB = this.chartController.getThemeColor("--chart-b");
     this.chartController.register(document.getElementById("tokensChart"), this.state.summary?.series || [], {
       labelA: "Input",
       labelB: "Output",
       valueA: (row) => row.input_tokens || 0,
       valueB: (row) => row.output_tokens || 0,
-      colorA: "#2563eb",
-      colorB: "#0f9f6e",
+      colorA: chartA,
+      colorB: chartB,
       formatter: fmtInt,
     });
     this.chartController.register(document.getElementById("costChart"), this.state.summary?.series || [], {
       labelA: "Cost",
       valueA: (row) => row.estimated_cost || 0,
-      colorA: "#2563eb",
+      colorA: chartA,
       formatter: (value) => `$${Number(value).toFixed(5)}`,
     });
 
@@ -1425,7 +1536,7 @@ class DashboardApp {
     this.chartController.register(document.getElementById("cumulativeCostChart"), cumulativeCost, {
       labelA: "Cumulative Cost",
       valueA: (row) => row.cumulative_cost || 0,
-      colorA: "#0f9f6e",
+      colorA: chartB,
       formatter: (value) => `$${Number(value).toFixed(5)}`,
     });
 
@@ -1441,7 +1552,7 @@ class DashboardApp {
     this.chartController.register(document.getElementById("cumulativeTokensChart"), cumulativeTokens, {
       labelA: "Cumulative Tokens",
       valueA: (row) => row.cumulative_tokens || 0,
-      colorA: "#0f9f6e",
+      colorA: chartB,
       formatter: fmtInt,
     });
   }

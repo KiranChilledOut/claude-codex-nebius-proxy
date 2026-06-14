@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, Response
 
 from src.conversion.request_converter import _get_context_limit
 from src.core.config import config
@@ -32,9 +32,10 @@ async def validate_dashboard_api_key(
         raise HTTPException(status_code=401, detail="Invalid API key.")
 
 
-@router.get("/dashboard", response_class=HTMLResponse)
+@router.get("/dashboard")
 async def dashboard(_: None = Depends(validate_dashboard_api_key)):
-    return HTMLResponse((STATIC_DIR / "dashboard.html").read_text(encoding="utf-8"))
+    html = (STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
+    return Response(content=html, media_type="text/html; charset=utf-8")
 
 
 @router.get("/dashboard/assets/{asset_name}")
@@ -45,7 +46,17 @@ async def dashboard_asset(asset_name: str, _: None = Depends(validate_dashboard_
     }
     if asset_name not in allowed:
         raise HTTPException(status_code=404, detail="Asset not found")
-    return FileResponse(STATIC_DIR / asset_name, media_type=allowed[asset_name])
+    return FileResponse(
+        STATIC_DIR / asset_name,
+        media_type=allowed[asset_name],
+        headers={"Cache-Control": "public, max-age=3600, must-revalidate"},
+    )
+
+
+@router.get("/dashboard/health")
+async def dashboard_health(_: None = Depends(validate_dashboard_api_key)):
+    """Quick endpoint for checking dashboard availability (useful for load balancers / Uptime Kuma)."""
+    return {"status": "ok", "version": "1.0"}
 
 
 @router.get("/api/observability/summary")
