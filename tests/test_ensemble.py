@@ -84,7 +84,8 @@ def test_unknown_tool_and_empty_response_are_penalized():
     )
 
     assert race.winner.model == "model-b"
-    assert any("unknown tool" in r for r in race.candidates[0].reasons)
+    model_a = next(c for c in race.candidates if c.model == "model-a")
+    assert any("unknown tool" in r for r in model_a.reasons)
 
 
 def test_single_error_does_not_kill_the_race():
