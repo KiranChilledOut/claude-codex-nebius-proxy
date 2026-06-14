@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dashboard root (`/dashboard`) content-type is now explicitly `text/html; charset=utf-8`.
 
 ### Fixed
+- Missing `from src.core.config import config` in `tests/test_observability.py` — the `client` fixture monkeypatches `config.ignore_client_api_key` but `config` was never imported, causing `NameError` at test collection.
 - Streaming responses now report real provider token usage instead of zeros.
   The stream converter exited at `finish_reason` before the trailing
   empty-choices usage chunk (sent by `stream_options.include_usage`) arrived;

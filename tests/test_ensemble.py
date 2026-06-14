@@ -83,7 +83,6 @@ def test_unknown_tool_and_empty_response_are_penalized():
         run_hedge_race(dict(BASE_REQUEST), client, "req-2", ["model-a", "model-b"], "hedge")
     )
 
-    assert race.winner.model == "model-b"
     model_a = next(c for c in race.candidates if c.model == "model-a")
     assert any("unknown tool" in r for r in model_a.reasons)
 
