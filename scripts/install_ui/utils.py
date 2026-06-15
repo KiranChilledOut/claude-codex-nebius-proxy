@@ -369,7 +369,7 @@ def append_shell_function(
 
 def _append_bash_zsh(rc_path: str, port: int, repo_root: pathlib.Path) -> None:
     func = f"""
-# Claude Shell Function — enables claude, claude --proxy, and claudius
+# Claude Shell Function — enables claude, claude --proxy, claude --voice, and claudius
 claude() {{
     local main_proxy="http://localhost:{port}"
     local repo_root="{repo_root}"
@@ -396,6 +396,12 @@ claude() {{
         kill "$forwarder_pid" 2>/dev/null || true
         wait "$forwarder_pid" 2>/dev/null || true
         return $claude_exit
+    elif [[ "$1" == "--voice" ]]; then
+        if [[ "$2" == "--proxy" ]]; then
+            python3 "$repo_root/scripts/claude-voice.py" --handsfree --proxy
+        else
+            python3 "$repo_root/scripts/claude-voice.py" --handsfree
+        fi
     else
         printf "\\033[38;5;46m▐▛▜▌ Claude Direct\\033[0m  \\033[38;5;244m→ subscription login auth\\033[0m\\n"
         (
@@ -405,6 +411,8 @@ claude() {{
     fi
 }}
 alias claudius='claude --proxy'
+alias claudio='claude --voice'
+alias claudio-proxy='claude --voice --proxy'
 """
     with open(rc_path, "a", encoding="utf-8") as f:
         f.write(func)
@@ -412,7 +420,7 @@ alias claudius='claude --proxy'
 
 def _append_pwsh(rc_path: str, port: int, repo_root: pathlib.Path) -> None:
     func = f"""
-# Claude Shell Function - enables claude, claude --proxy, and claudius
+# Claude Shell Function - enables claude, claude --proxy, claude --voice, and claudius
 function claude {{
     param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $ClaudeArgs)
     $mainProxy = "http://localhost:{port}"
@@ -449,6 +457,12 @@ function claude {{
             if ($null -eq $oldApiKey) {{ Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_API_KEY = $oldApiKey }}
             if ($null -eq $oldBaseUrl) {{ Remove-Item Env:ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_BASE_URL = $oldBaseUrl }}
         }}
+    }} elseif ($ClaudeArgs.Count -gt 0 -and $ClaudeArgs[0] -eq "--voice") {{
+        if ($ClaudeArgs.Count -gt 1 -and $ClaudeArgs[1] -eq "--proxy") {{
+            python3 "$repoRoot/scripts/claude-voice.py" --handsfree --proxy
+        }} else {{
+            python3 "$repoRoot/scripts/claude-voice.py" --handsfree
+        }}
     }} else {{
         Write-Host "`e[38;5;46m▐▛▜▌ Claude Direct`e[0m  `e[38;5;244m-> subscription login auth`e[0m"
         try {{
@@ -466,6 +480,14 @@ function claude {{
 function claudius {{
     param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $ClaudeArgs)
     claude --proxy @ClaudeArgs
+}}
+function claudio {{
+    param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $ClaudeArgs)
+    claude --voice @ClaudeArgs
+}}
+function claudio-proxy {{
+    param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $ClaudeArgs)
+    claude --voice @(@("--proxy") + $ClaudeArgs)
 }}
 """
     with open(rc_path, "a", encoding="utf-8") as f:

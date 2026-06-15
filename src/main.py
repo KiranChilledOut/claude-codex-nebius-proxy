@@ -17,6 +17,15 @@ app = FastAPI(title="Claude-to-OpenAI API Proxy", version="1.0.0")
 app.include_router(api_router)
 app.include_router(observability_router)
 
+# Conditional voice router — only when VOICE_ENABLED
+if config.voice_enabled:
+    try:
+        from src.voice.routes import router as voice_router
+        app.include_router(voice_router, prefix="/voice")
+        print("Voice endpoints registered at /voice/*")
+    except ImportError as e:
+        print(f"Warning: Voice feature enabled but import failed: {e}")
+
 
 @app.exception_handler(RequestValidationError)
 async def log_validation_error(request: Request, exc: RequestValidationError):
@@ -158,6 +167,13 @@ def main():
         "   Request Optimizations: "
         f"{'Enabled' if config.enable_request_optimizations else 'Disabled'}"
     )
+    if config.voice_enabled:
+        print(
+            "   Voice Features: Enabled "
+            f"(TTS: {config.tts_provider_url}, STT: {config.stt_provider_url})"
+        )
+    else:
+        print("   Voice Features: Disabled (set VOICE_ENABLED=true to enable)")
     print("")
 
     # Parse log level - extract just the first word to handle comments

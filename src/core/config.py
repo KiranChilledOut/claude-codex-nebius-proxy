@@ -148,6 +148,41 @@ class Config:
             self.statusline_percent_adjust = 0
         self.statusline_percent_adjust = max(-100, min(100, self.statusline_percent_adjust))
 
+        # --- Voice features ---
+        self.voice_enabled = os.environ.get("VOICE_ENABLED", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self.tts_provider_url = os.environ.get("TTS_PROVIDER_URL", "http://localhost:8880")
+        self.tts_fallback_url = os.environ.get("TTS_FALLBACK_URL", "").strip()
+        self.tts_voice = os.environ.get("TTS_VOICE", "af_river")
+        self.tts_model = os.environ.get("TTS_MODEL", "kokoro")
+        self.tts_response_format = os.environ.get("TTS_RESPONSE_FORMAT", "mp3")
+        try:
+            self.tts_speed = float(os.environ.get("TTS_SPEED", "1.0"))
+        except (ValueError, TypeError):
+            self.tts_speed = 1.0
+        self.stt_provider_url = os.environ.get("STT_PROVIDER_URL", "http://localhost:2022")
+        self.stt_fallback_url = os.environ.get("STT_FALLBACK_URL", "").strip()
+        self.voice_profiles_dir = os.environ.get("VOICE_PROFILES_DIR", "")
+        self.hear_binary_path = os.environ.get("HEAR_BINARY_PATH", "")
+        self.say_binary_path = os.environ.get("SAY_BINARY_PATH", "/usr/bin/say")
+        self.claude_voice_locale = os.environ.get("CLAUDE_VOICE_LOCALE", "en-US")
+        try:
+            self.claude_voice_silence = int(os.environ.get("CLAUDE_VOICE_SILENCE", "2"))
+        except (ValueError, TypeError):
+            self.claude_voice_silence = 2
+        try:
+            self.claude_voice_max_chars = int(os.environ.get("CLAUDE_VOICE_MAX_CHARS", "600"))
+        except (ValueError, TypeError):
+            self.claude_voice_max_chars = 600
+        try:
+            self.claude_voice_rate = int(os.environ.get("CLAUDE_VOICE_RATE", "190"))
+        except (ValueError, TypeError):
+            self.claude_voice_rate = 190
+        self.claude_voice_name = os.environ.get("CLAUDE_VOICE_NAME", "").strip()
+
         # Ensure bounds are sane even with misconfigured env values.
         if self.max_tokens_limit < 1:
             self.max_tokens_limit = 1

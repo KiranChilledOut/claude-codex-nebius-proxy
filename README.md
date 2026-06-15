@@ -27,18 +27,22 @@ This launches a step-by-step TUI that:
 7. Runs a smoke test
 8. Optionally adds `claude` / `claudius` shell shortcuts
 9. Optionally configures Claude Code statusline
+10. Optionally enables voice features
 
 After it finishes:
 
 ```bash
 claude --proxy        # or just 'claudius' if you added the shell shortcuts
+# OR voice mode (hands-free)
+claude --voice --proxy
 # OR
 claudius
-# OR
 .venv/bin/python start_proxy.py
 ```
 
 Then open http://localhost:8083/dashboard for the observability dashboard.
+
+Voice features: see [docs/VOICE.md](docs/VOICE.md) for setup.
 
 ## Prerequisites
 

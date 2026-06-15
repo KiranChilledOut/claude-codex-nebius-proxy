@@ -14,7 +14,16 @@ What the installed function does:
 | `claude` | Direct Claude Code (subscription login) |
 | `claude --proxy` | Proxy mode via Nebius with session forwarder |
 | `claude --proxy <dir>` | Proxy mode starting in a specific directory |
+| `claude --voice` | Hands-free voice conversation (direct mode) |
+| `claude --voice --proxy` | Hands-free voice conversation via proxy |
 | `claudius` | Alias for `claude --proxy` |
+| `claudio` | Alias for `claude --voice` |
+| `claudio-proxy` | Alias for `claude --voice --proxy` |
+
+**Voice mode** (`--voice`) opens a tmux HUD: Claude Code on top, voice
+status below. Speak after the 🎤 prompt — the utterance auto-sends after
+silence, Claude's reply is spoken aloud, and listening resumes. Say
+"goodbye claude" to stop. See [docs/VOICE.md](VOICE.md) for full setup.
 
 ## Session Forwarder
 
