@@ -95,11 +95,52 @@ def _map_finish_reason(finish_reason: Optional[str]) -> str:
     }.get(finish_reason or "stop", Constants.STOP_END_TURN)
 
 
+def scale_usage_for_client(usage: Optional[dict], scale: float) -> Optional[dict]:
+    """Rescale input-side usage into the selected Claude model's context-window
+    units (see compute_usage_scale) so Claude Code's native auto-compaction
+    fires when the backend window is filling.
+
+    output_tokens is deliberately NOT scaled: Claude Code enforces a hard
+    output-token maximum (CLAUDE_CODE_MAX_OUTPUT_TOKENS) against that field,
+    and inflating it would trip the guard spuriously. Output is bounded by
+    max_tokens (~16K) vs a 200K+ window, so the compaction math stays accurate.
+    """
+    if not usage or scale == 1.0:
+        return usage
+    scaled = dict(usage)
+    for key in (
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ):
+        if key in scaled:
+            scaled[key] = int(round((scaled[key] or 0) * scale))
+    return scaled
+
+
+def error_type_for_status(status_code: Optional[int]) -> str:
+    """Map an HTTP status to the Anthropic error type Claude Code keys its
+    retry/backoff behavior on (e.g. 429 must surface as rate_limit_error)."""
+    return {
+        400: "invalid_request_error",
+        401: "authentication_error",
+        403: "permission_error",
+        404: "not_found_error",
+        413: "request_too_large",
+        429: "rate_limit_error",
+        529: "overloaded_error",
+    }.get(status_code or 0, "api_error")
+
+
 def _extract_usage(usage_raw: Optional[dict]) -> dict:
     """Build a Claude-style usage dict from OpenAI usage data.
 
-    Covers prompt_tokens, completion_tokens, cached_tokens and also
-    returns cache_creation_input_tokens (Feature 5).
+    Anthropic semantics: input_tokens EXCLUDES cached tokens — clients
+    (Claude Code) sum input + cache_read + cache_creation to get the real
+    context size. OpenAI-style prompt_tokens INCLUDES the cached portion,
+    so it must be split here, otherwise cached tokens are double-counted.
+    cache_creation stays 0: upstream prefix caching is automatic and
+    OpenAI-format usage has no cache-write counter.
     """
     if not usage_raw:
         return {
@@ -110,22 +151,15 @@ def _extract_usage(usage_raw: Optional[dict]) -> dict:
         }
 
     cache_read = 0
-    cache_creation = 0
     prompt_details = usage_raw.get("prompt_tokens_details") or {}
     if prompt_details:
         cache_read = prompt_details.get("cached_tokens", 0) or 0
-    # Some providers report cache_creation separately
-    completion_details = usage_raw.get("completion_tokens_details") or {}
-    # Approximate cache_creation as total prompt minus cached portion when the
-    # provider doesn't expose it explicitly — this gives Claude Code a usable
-    # number for cost display without breaking anything.
     prompt_tokens = usage_raw.get("prompt_tokens", 0) or 0
-    cache_creation = max(prompt_tokens - cache_read, 0) if cache_read else 0
 
     return {
-        "input_tokens": prompt_tokens,
+        "input_tokens": max(prompt_tokens - cache_read, 0),
         "output_tokens": usage_raw.get("completion_tokens", 0) or 0,
-        "cache_creation_input_tokens": cache_creation,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": cache_read,
     }
 
@@ -548,6 +582,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     openai_client=None,
     request_id: Optional[str] = None,
     observability_context: Optional[dict] = None,
+    usage_scale: float = 1.0,
 ):
     """Convert OpenAI streaming response to Claude streaming format.
 
@@ -614,6 +649,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     }
     estimated_output_tokens = 0
     observed_tool_calls = []
+    stream_finished = False
     started_blocks = []  # track indices of blocks we've started (for Fix 4)
     stopped_blocks = set()  # track indices already stopped (avoid double-stop)
 
@@ -921,6 +957,10 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             choices = chunk.get("choices", [])
             if not choices:
                 continue
+            if stream_finished:
+                # finish_reason already handled; we're only draining for the
+                # trailing usage chunk at this point.
+                continue
 
             choice = choices[0]
             delta = choice.get("delta", {})
@@ -1135,7 +1175,11 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                     observability_context["stop_reason"] = final_stop_reason
                     observability_context["tool_calls"] = observed_tool_calls
                     observability_context["estimated_output_tokens"] = estimated_output_tokens
-                break
+                # Don't break: with stream_options.include_usage the real
+                # token usage arrives in a trailing empty-choices chunk AFTER
+                # the finish chunk. Keep draining until [DONE] so message_delta
+                # carries provider usage instead of zeros.
+                stream_finished = True
 
     except HTTPException as e:
         if observability_context is not None:
@@ -1152,7 +1196,22 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                 },
             )
             return
-        raise
+        # Stream setup happens lazily inside this generator, after the 200 and
+        # SSE headers are already sent. Re-raising would just drop the
+        # connection mid-stream; emit a typed Anthropic error event instead so
+        # the client (and its agentic retry/backoff) sees rate_limit_error etc.
+        logger.error(f"Upstream error during stream (HTTP {e.status_code}): {e.detail}")
+        yield _sse(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": error_type_for_status(e.status_code),
+                    "message": str(e.detail),
+                },
+            },
+        )
+        return
     except Exception as e:
         logger.error(f"Streaming error: {e}")
         logger.error(traceback.format_exc())
@@ -1222,12 +1281,14 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             )
 
     # --- message_delta with final stop reason + usage ---
+    # Client gets window-scaled usage (native auto-compaction); observability
+    # below keeps the raw backend numbers.
     yield _sse(
         Constants.EVENT_MESSAGE_DELTA,
         {
             "type": Constants.EVENT_MESSAGE_DELTA,
             "delta": {"stop_reason": final_stop_reason, "stop_sequence": None},
-            "usage": usage_data,
+            "usage": scale_usage_for_client(usage_data, usage_scale),
         },
     )
     yield _sse(Constants.EVENT_MESSAGE_STOP, {"type": Constants.EVENT_MESSAGE_STOP})

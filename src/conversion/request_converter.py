@@ -115,6 +115,39 @@ def _get_context_limit(model_name: str) -> int:
     return DEFAULT_CONTEXT_LIMIT
 
 
+def claude_context_window(claude_model: str, beta_header: str = "") -> int:
+    """Context window Claude Code assumes for the selected Claude model.
+
+    1M when the client opts into long context (a "[1m]" model suffix or the
+    anthropic-beta context-1m-* header); otherwise the standard 200K.
+    """
+    model_lower = (claude_model or "").lower()
+    if "[1m]" in model_lower or "context-1m" in (beta_header or "").lower():
+        return 1_000_000
+    return 200_000
+
+
+def compute_usage_scale(claude_model: str, backend_model: str, beta_header: str = "") -> float:
+    """Factor converting backend token counts into the selected Claude model's
+    context-window units.
+
+    Claude Code triggers auto-compaction when reported usage approaches the
+    window of the *Claude* model the user selected — it knows nothing about
+    the backend's real window. Scaling reported usage by
+    claude_window / backend_window makes that native compaction fire exactly
+    when the BACKEND window is filling, for any model pairing (e.g. Fable
+    1M selected, Kimi 204800 actual). Returns 1.0 when the windows already
+    line up (within 2%).
+    """
+    backend_window = _get_context_limit(backend_model)
+    if backend_window <= 0:
+        return 1.0
+    scale = claude_context_window(claude_model, beta_header) / backend_window
+    if abs(scale - 1.0) < 0.02:
+        return 1.0
+    return scale
+
+
 def _map_client_effort(effort) -> Optional[str]:
     """Map an Anthropic effort level (output_config.effort) to a backend
     reasoning_effort. Backends generally accept low/medium/high, so the
@@ -605,6 +638,20 @@ def convert_claude_to_openai(
         openai_request["stop"] = claude_request.stop_sequences
     if claude_request.top_p is not None:
         openai_request["top_p"] = claude_request.top_p
+    if claude_request.top_k is not None and not config.azure_api_version:
+        # top_k is a vLLM-style extension field, not an SDK parameter —
+        # verified accepted on Nebius Token Factory; Azure may reject it.
+        openai_request.setdefault("extra_body", {})["top_k"] = claude_request.top_k
+
+    # Forward Claude Code's per-session identity (metadata.user_id) for
+    # upstream attribution, plus prompt_cache_key so parallel subagent
+    # requests from one session get prefix-cache routing affinity. Both
+    # verified accepted on Nebius Token Factory; harmless no-ops elsewhere.
+    metadata_user_id = (claude_request.metadata or {}).get("user_id")
+    if isinstance(metadata_user_id, str) and metadata_user_id.strip():
+        openai_request["user"] = metadata_user_id.strip()[:256]
+        if not config.azure_api_version:
+            openai_request["prompt_cache_key"] = metadata_user_id.strip()[:256]
 
     # Convert tools — handles both standard and schema-less (computer use) tools
     if allow_tools and claude_request.tools:

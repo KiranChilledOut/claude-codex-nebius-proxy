@@ -174,3 +174,69 @@ def test_requested_max_tokens_is_not_forced_up_by_min_tokens_limit(monkeypatch):
         assert openai_request["max_tokens"] <= 64
     finally:
         monkeypatch.setattr(config, "min_tokens_limit", original_min)
+
+
+def test_metadata_user_id_forwarded_as_user_and_prompt_cache_key():
+    """metadata.user_id should reach the backend as `user` (attribution) and
+    `prompt_cache_key` (prefix-cache routing affinity for subagent fleets)."""
+    request = ClaudeMessagesRequest(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=64,
+        messages=[ClaudeMessage(role="user", content="hello")],
+        metadata={"user_id": "user_abc_session_123"},
+    )
+
+    openai_request = convert_claude_to_openai(request, model_manager)
+
+    assert openai_request["user"] == "user_abc_session_123"
+    assert openai_request["prompt_cache_key"] == "user_abc_session_123"
+
+
+def test_no_metadata_means_no_user_or_prompt_cache_key():
+    request = ClaudeMessagesRequest(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=64,
+        messages=[ClaudeMessage(role="user", content="hello")],
+    )
+
+    openai_request = convert_claude_to_openai(request, model_manager)
+
+    assert "user" not in openai_request
+    assert "prompt_cache_key" not in openai_request
+    assert "extra_body" not in openai_request
+
+
+def test_top_k_forwarded_via_extra_body():
+    request = ClaudeMessagesRequest(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=64,
+        messages=[ClaudeMessage(role="user", content="hello")],
+        top_k=40,
+    )
+
+    openai_request = convert_claude_to_openai(request, model_manager)
+
+    assert openai_request["extra_body"]["top_k"] == 40
+
+
+def test_claude_context_window_detection():
+    from src.conversion.request_converter import claude_context_window
+
+    assert claude_context_window("claude-sonnet-4-6") == 200_000
+    assert claude_context_window("claude-fable-5") == 200_000
+    assert claude_context_window("claude-sonnet-4-6[1m]") == 1_000_000
+    assert claude_context_window("claude-fable-5", "context-1m-2025-08-07") == 1_000_000
+
+
+def test_compute_usage_scale_maps_windows(monkeypatch):
+    from src.conversion.request_converter import compute_usage_scale
+
+    monkeypatch.setattr(config, "big_model", "backend/big")
+    monkeypatch.setattr(config, "big_model_context_limit", 100_000)
+    # 200K claude window over 100K backend window -> inflate 2x
+    assert compute_usage_scale("claude-opus-4", "backend/big") == 2.0
+    # 1M claude window over 100K backend window -> inflate 10x
+    assert compute_usage_scale("claude-opus-4[1m]", "backend/big") == 10.0
+    # Windows already aligned (within 2%) -> no scaling
+    monkeypatch.setattr(config, "big_model_context_limit", 201_000)
+    assert compute_usage_scale("claude-opus-4", "backend/big") == 1.0

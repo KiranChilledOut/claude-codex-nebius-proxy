@@ -13,6 +13,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Multi-theme selector (5 themes): **Lime** (default, cyberpunk), **Navy & White** (corporate), **Mono** (high-contrast), **Star Wars** (Imperial/Sith), **KTM** (orange/black). Replaced binary light/dark toggle in `dashboard.css`, `dashboard.js`, `dashboard.html`.
+- `/dashboard/health` endpoint — lightweight availability check returning `{"status": "ok", "version": "1.0"}`, useful for load balancers and uptime monitors.
+- `Cache-Control: public, max-age=3600, must-revalidate` headers on dashboard static assets (`/dashboard/assets/*`).
+
+### Quality of Life
+- Dashboard root (`/dashboard`) content-type is now explicitly `text/html; charset=utf-8`.
+
+### Fixed
+- Missing `from src.core.config import config` in `tests/test_observability.py` — the `client` fixture monkeypatches `config.ignore_client_api_key` but `config` was never imported, causing `NameError` at test collection.
+- Streaming responses now report real provider token usage instead of zeros.
+  The stream converter exited at `finish_reason` before the trailing
+  empty-choices usage chunk (sent by `stream_options.include_usage`) arrived;
+  it now drains the stream until `[DONE]`, so `message_delta` carries actual
+  `input_tokens`/`output_tokens`/`cache_read_input_tokens`.
+- Cached tokens are no longer double-counted in usage. Anthropic semantics:
+  `input_tokens` excludes cached tokens (clients sum
+  `input + cache_read + cache_creation` for context size), while OpenAI-style
+  `prompt_tokens` includes them. The proxy now reports the uncached remainder
+  as `input_tokens` and stops synthesizing `cache_creation_input_tokens`.
+  Observability `total_tokens` and cost estimates still bill the full prompt.
+
+### Added
+- Ensemble streaming (hedge racing): `ENSEMBLE_MODE=hedge|approval` races one
+  request across `ENSEMBLE_MODELS` in parallel and returns the best response.
+  Candidates are scored on tool-call validity, finish_reason, and speed; a
+  single healthy model keeps the session alive even when others 429/500.
+  `approval` mode holds the Claude Code stream (with pings) while the user
+  picks the winner on the dashboard (`ENSEMBLE_APPROVAL_TIMEOUT_S` fallback
+  to the auto-winner). Every race is recorded per candidate (output, verdict
+  reasons, latency, who chose) in a new `ensemble_candidates` table, shown as
+  a split view under each session in the dashboard with Continue-with-this
+  buttons and a global pending-approval banner. New endpoints:
+  `GET /api/observability/ensemble/runs`, `GET .../ensemble/pending`,
+  `POST .../ensemble/choose`. Default `ENSEMBLE_MODE=off` — behavior is
+  unchanged unless enabled. Files: `src/ensemble/`, `src/api/endpoints.py`,
+  `src/observability/`.
+  - The racer takes precedence over the server-side search branch and runs
+    the Tavily search loop per candidate — Claude Code's main loop always
+    offers WebSearch, so without this every real turn bypassed the race
+    (and approval mode never held).
+  - Approval holds only streamed requests that offer tools; tool-less
+    housekeeping probes (title generation, quota checks) pass through
+    immediately instead of stalling for the approval timeout.
+  - Optional `ENSEMBLE_JUDGE_MODEL`: an LLM judge (same Token Factory key,
+    any catalog model) breaks rule-score ties and records its reasoning on
+    the winner's card; judge failure falls back to rules silently.
+  - Winner cards always carry an explicit `decision:` reason (higher score /
+    score tie + latency gap / judge verdict); dashboard cards show token
+    counts, a "(no text output)" placeholder, and collapsible full output.
+- Dynamic context-window mapping: live usage and `count_tokens` are reported
+  in the selected Claude model's window units
+  (`claude_window / backend_window`, with 1M detected from the `[1m]` model
+  suffix or `anthropic-beta: context-1m-*` header). Claude Code's native
+  auto-compaction now fires when the *backend's* real window is filling —
+  for any Claude-model/backend pairing — instead of overflowing the backend
+  (the "exceeded the 128000 output token maximum" death loop after context
+  fills). `output_tokens` is intentionally not scaled
+  (CLAUDE_CODE_MAX_OUTPUT_TOKENS guards that field); observability keeps raw
+  backend tokens so the dashboard and statusline stay truthful.
+- Forward `metadata.user_id` upstream as `user` (per-session attribution) and
+  `prompt_cache_key` (prefix-cache routing affinity for parallel subagent
+  requests). Verified accepted by Nebius Token Factory; skipped on Azure.
+- Forward Claude `top_k` via `extra_body` (vLLM-style backends honor it;
+  skipped on Azure).
+- Rate-limit pacing: retry backoff now honors the upstream `Retry-After` /
+  `x-ratelimit-reset-requests` hint (clamped to 30s) instead of blind
+  exponential backoff, and propagated 429s carry a `retry-after` header.
+- Streaming errors now surface typed Anthropic error events
+  (`rate_limit_error`, `authentication_error`, `overloaded_error`, …) instead
+  of a generic `api_error` or a dropped connection, so Claude Code's retry
+  and backoff logic engages correctly.
 - `UvicornAccessFilter` logging module that suppresses noisy 200 OK access logs for dashboard observability endpoints. At `WARNING` level all successful requests are hidden; at `INFO` level only dashboard polls are filtered, keeping errors visible. `src/core/logging.py`.
 - `/v1/models` now dynamically fetches upstream provider models and appends them to the response. `OpenAIClient.list_models()` calls the backend `/v1/models`, and the endpoint merges discovered models alongside the existing Claude aliases and custom env mappings.
 - Codex server-side web search (Tavily). When `TAVILY_API_KEY` is set, `web_search` built-in tools from Codex CLI are promoted to OpenAI function tools, the proxy injects `SEARCH_TOOL_SYSTEM_SUPPLEMENT` into the system prompt, and `run_search_loop()` executes the search server-side (same pattern as the Claude Code path). A new `codex_response_to_sse()` generator converts the final non-streaming response into synthetic SSE events for streaming clients. Files: `src/codex/tools_compat.py`, `src/codex/request_converter.py`, `src/codex/stream_converter.py`, `src/api/endpoints.py`.

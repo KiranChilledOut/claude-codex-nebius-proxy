@@ -264,3 +264,53 @@ def test_claude_response_to_sse_empty_content():
     # still emits a valid lifecycle with at least one block
     assert "content_block_start" in sse
     assert "event: message_stop" in sse
+
+
+def test_usage_excludes_cached_tokens_from_input_tokens():
+    """Anthropic input_tokens excludes cached tokens; OpenAI prompt_tokens
+    includes them. Splitting wrong double-counts context in Claude Code."""
+    from src.conversion.response_converter import _extract_usage
+
+    usage = _extract_usage(
+        {
+            "prompt_tokens": 5862,
+            "completion_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 5856},
+        }
+    )
+
+    assert usage["input_tokens"] == 6
+    assert usage["cache_read_input_tokens"] == 5856
+    assert usage["cache_creation_input_tokens"] == 0
+    assert usage["output_tokens"] == 8
+
+
+def test_usage_without_cache_details_is_unchanged():
+    from src.conversion.response_converter import _extract_usage
+
+    usage = _extract_usage({"prompt_tokens": 100, "completion_tokens": 20})
+
+    assert usage["input_tokens"] == 100
+    assert usage["cache_read_input_tokens"] == 0
+    assert usage["cache_creation_input_tokens"] == 0
+
+
+def test_scale_usage_for_client_scales_input_side_only():
+    from src.conversion.response_converter import scale_usage_for_client
+
+    usage = {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cache_creation_input_tokens": 10,
+        "cache_read_input_tokens": 1000,
+    }
+    scaled = scale_usage_for_client(usage, 2.0)
+
+    assert scaled["input_tokens"] == 200
+    assert scaled["cache_creation_input_tokens"] == 20
+    assert scaled["cache_read_input_tokens"] == 2000
+    # output_tokens must NOT scale: Claude Code enforces
+    # CLAUDE_CODE_MAX_OUTPUT_TOKENS against this field.
+    assert scaled["output_tokens"] == 50
+    # scale 1.0 is a no-op passthrough
+    assert scale_usage_for_client(usage, 1.0) is usage

@@ -122,6 +122,29 @@ class Config:
             "ENABLE_FILEPATH_EXTRACTION_MOCK", "true"
         ).lower() in ("1", "true", "yes")
 
+        # --- Ensemble streaming (hedge racing) ---
+        # off      = normal single-model proxying (default)
+        # hedge    = race ENSEMBLE_MODELS in parallel, auto-pick the best
+        #            response (tool-call validity > finish_reason > speed)
+        # approval = race, then hold the stream (with pings) until the user
+        #            picks a winner on the dashboard, or the timeout elapses
+        #            and the auto-winner stands.
+        self.ensemble_mode = os.environ.get("ENSEMBLE_MODE", "off").strip().lower()
+        self.ensemble_models = [
+            m.strip()
+            for m in os.environ.get("ENSEMBLE_MODELS", "").split(",")
+            if m.strip()
+        ]
+        try:
+            self.ensemble_approval_timeout = int(
+                os.environ.get("ENSEMBLE_APPROVAL_TIMEOUT_S", "120") or 120
+            )
+        except ValueError:
+            self.ensemble_approval_timeout = 120
+        # Optional LLM judge for rule-score ties (same Token Factory key —
+        # just a model name). Empty = rule-based scoring only.
+        self.ensemble_judge_model = os.environ.get("ENSEMBLE_JUDGE_MODEL", "").strip()
+
         # Codex proxy configuration
         self.codex_enabled = os.environ.get("CODEX_ENABLED", "true").lower() in (
             "1",

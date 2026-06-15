@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from fastapi import HTTPException
@@ -45,6 +46,32 @@ def _maybe_drop_reasoning_effort(req: Dict[str, Any], error: Exception) -> bool:
         model,
     )
     return True
+
+
+def _retry_after_seconds(error: Optional[Exception]) -> Optional[float]:
+    """Upstream-suggested wait before retrying, from Retry-After or the
+    Token-Factory-style x-ratelimit-reset-requests header (e.g. "1s", "13s").
+    Returns None when the error carries no usable hint. Clamped to 30s."""
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw = headers.get("retry-after") or headers.get("x-ratelimit-reset-requests")
+    if not raw:
+        return None
+    raw = str(raw).strip().lower()
+    try:
+        if raw.endswith("ms"):
+            seconds = float(raw[:-2]) / 1000
+        elif raw.endswith("s"):
+            seconds = float(raw[:-1])
+        elif raw.endswith("m"):
+            seconds = float(raw[:-1]) * 60
+        else:
+            seconds = float(raw)
+    except ValueError:
+        return None
+    return max(0.0, min(seconds, 30.0))
 
 
 _CONTEXT_LEN_MARKERS = (
@@ -142,9 +169,25 @@ class OpenAIClient:
             return status_code is None or status_code >= 500 or status_code in (408, 429)
         return False
 
-    async def _sleep_before_retry(self, attempt: int) -> None:
-        delay = self.retry_backoff_seconds * (2**attempt)
+    async def _sleep_before_retry(self, attempt: int, error: Optional[Exception] = None) -> None:
+        # Prefer the upstream's own pacing hint (Retry-After) over blind
+        # exponential backoff — keeps parallel subagent retries from
+        # thundering back early on rate limits.
+        delay = _retry_after_seconds(error)
+        if delay is None:
+            delay = self.retry_backoff_seconds * (2**attempt)
         await asyncio.sleep(delay)
+
+    @staticmethod
+    def _rate_limit_headers(error: Exception, status_code: Optional[int]) -> Optional[Dict[str, str]]:
+        """Retry-After header to attach to a propagated 429 so the client can
+        pace itself instead of retrying immediately."""
+        if status_code != 429:
+            return None
+        seconds = _retry_after_seconds(error)
+        if seconds is None:
+            return None
+        return {"retry-after": str(max(1, math.ceil(seconds)))}
 
     async def create_chat_completion(
         self, request: Dict[str, Any], request_id: Optional[str] = None
@@ -213,7 +256,7 @@ class OpenAIClient:
                             attempt + 1,
                             self.max_retries,
                         )
-                        await self._sleep_before_retry(attempt)
+                        await self._sleep_before_retry(attempt, e)
                         continue
                     status_code = getattr(e, "status_code", None)
                     if isinstance(e, RateLimitError):
@@ -221,6 +264,7 @@ class OpenAIClient:
                     raise HTTPException(
                         status_code=status_code or 500,
                         detail=self.classify_openai_error(str(e)),
+                        headers=self._rate_limit_headers(e, status_code),
                     )
                 except Exception as e:
                     raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
@@ -275,7 +319,7 @@ class OpenAIClient:
                             attempt + 1,
                             self.max_retries,
                         )
-                        await self._sleep_before_retry(attempt)
+                        await self._sleep_before_retry(attempt, e)
                         continue
                     status_code = getattr(e, "status_code", None)
                     if isinstance(e, RateLimitError):
@@ -283,6 +327,7 @@ class OpenAIClient:
                     raise HTTPException(
                         status_code=status_code or 500,
                         detail=self.classify_openai_error(str(e)),
+                        headers=self._rate_limit_headers(e, status_code),
                     )
 
             if streaming_completion is None:

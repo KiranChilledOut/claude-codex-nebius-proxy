@@ -1,12 +1,39 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="lime">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Claude Proxy Observability</title>
+    <title>Claude Proxy Observability Dashboard</title>
+    <meta name="description" content="Real-time observability dashboard for Claude Proxy API Gateway. Monitor token usage, costs, latency, and model performance across sessions." />
+    <meta name="author" content="Claude Proxy" />
+    <meta property="og:title" content="Claude Proxy Observability Dashboard" />
+    <meta property="og:description" content="Real-time observability dashboard for Claude Proxy API Gateway. Monitor token usage, costs, latency, and model performance across sessions." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="/dashboard" />
+    <meta property="og:image" content="/dashboard/assets/og-image.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Claude Proxy Observability Dashboard" />
+    <meta name="twitter:description" content="Real-time observability dashboard for Claude Proxy API Gateway. Monitor token usage, costs, latency, and model performance across sessions." />
+    <meta name="twitter:image" content="/dashboard/assets/og-image.png" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='48' fill='%239cee02'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/dashboard/assets/dashboard.css" />
   </head>
   <body>
+    <a href="#main-content" class="skip-link">Skip to main content</a>
+    <a href="#sidebar" class="skip-link">Skip to session navigation</a>
+    <!-- Loading screen / startup animation -->
+    <div id="loadingScreen" class="loading-screen" aria-label="Loading dashboard">
+      <div class="loading-ring" aria-hidden="true"></div>
+      <div class="loading-text" aria-hidden="true">Loading dashboard...</div>
+    </div>
+
+    <!-- Pending ensemble approvals (visible from any view) -->
+    <div id="approvalBanner" class="approval-banner" style="display:none" role="region" aria-label="Approval requests"></div>
+    <!-- Live region for data refresh announcements -->
+    <div id="refreshAnnounce" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+    <!-- Error banner for transient connection failures -->
+    <div id="errorBanner" class="error-banner" style="display:none" role="alert" aria-live="assertive"></div>
+
     <!-- Sidebar -->
     <aside class="sidebar" id="sidebar" aria-label="Session navigation">
       <div class="sidebar-header">
@@ -14,9 +41,9 @@
         <input type="search" class="session-search" id="sessionSearch" placeholder="Search sessions..." aria-label="Search sessions" />
       </div>
       <div class="sidebar-global">
-        <button class="session-card session-card--active" id="globalOverviewBtn" data-view="global">
-          <span class="session-card-title">Global Overview</span>
-          <span class="session-card-subtitle">All sessions aggregated</span>
+        <button type="button" class="session-card session-card--active" id="globalOverviewBtn" data-view="global">
+          <span class="global-overview-title">Global Overview</span>
+          <span class="global-overview-subtitle">All sessions aggregated</span>
         </button>
       </div>
       <div class="session-list" id="sessionList"></div>
@@ -35,7 +62,7 @@
       <!-- Top App Bar -->
       <header class="top-bar">
         <div class="top-bar-left">
-          <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">
+          <button type="button" class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">
             <svg class="icon-hamburger" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" fill="none"/></svg>
           </button>
           <h1 class="app-title">Claude Proxy</h1>
@@ -50,18 +77,24 @@
             <option value="720">1mo</option>
             <option value="8760">1yr</option>
           </select>
-          <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">
-            <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="2" fill="none"/></svg>
-            <svg class="icon-moon" viewBox="0 0 24 24" style="display:none" aria-hidden="true"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" fill="none" stroke="currentColor" stroke-width="2"/></svg>
-          </button>
-          <button class="refresh-btn" id="refreshBtn" aria-label="Refresh data">
-            <svg class="icon-refresh" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 4v6h6M23 20v-6h-6M20.49 9A9 9 0 002.69 6.77M3.51 15A9 9 0 0021.31 17.23" stroke="currentColor" stroke-width="2" fill="none"/></svg>
+          <select id="themeSelect" aria-label="Select theme">
+            <option value="lime" selected>🟢 Lime</option>
+            <option value="navy">🔵 Navy & White</option>
+            <option value="mono">⚫ Mono</option>
+            <option value="starwars">🔴 Star Wars</option>
+            <option value="ktm">🟠 KTM</option>
+          </select>
+          <button type="button" class="refresh-btn" id="refreshBtn" aria-label="Refresh data">
+            <svg class="icon-refresh" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M20.5 11A8.5 8.5 0 0 0 5.2 7.9M3.5 8l2.3-1.2L6.9 9M4 13a8.5 8.5 0 0 0 15.3 3.1M20 17l-2.3 1.2L15.1 16.9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M8 3.5a9.5 9.5 0 0 0-4 7.3M4 16.8a9.5 9.5 0 0 0 3.3 2.9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity="0.25"/>
+            </svg>
           </button>
         </div>
       </header>
 
       <!-- Content Area -->
-      <main class="content-area">
+      <main id="main-content" class="content-area">
         <!-- Global View (existing content) -->
         <div id="globalView">
           <p id="providerLine">Loading provider...</p>
@@ -288,7 +321,7 @@
         <!-- Session Detail View (hidden by default) -->
         <div id="sessionView" class="session-view" style="display: none;">
           <div class="session-header">
-            <button class="back-btn" id="backToGlobal">
+            <button type="button" class="back-btn" id="backToGlobal">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5m7 7l-7-7 7-7" stroke="currentColor" stroke-width="2" fill="none"/></svg>
               Back to Global
             </button>
@@ -353,6 +386,15 @@
             </div>
             <span class="context-percentage" id="sessionContextPercent">0%</span>
           </div>
+
+          <section class="panel ensemble-panel" id="ensemblePanel" style="display:none">
+            <div class="panel-head">
+              <h2>Ensemble Races</h2>
+              <span id="ensembleModeBadge" class="panel-count"></span>
+            </div>
+            <div id="ensemblePending"></div>
+            <div id="ensembleRuns"></div>
+          </section>
 
           <section class="chart-grid">
             <article class="panel">

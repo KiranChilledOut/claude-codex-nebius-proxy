@@ -97,7 +97,10 @@ class ObservabilityRecorder:
                 else "missing"
             )
         )
-        pricing = self.pricing_catalog.quote(backend_model, input_tokens, output_tokens)
+        # input_tokens excludes cached tokens (Anthropic semantics); the full
+        # prompt the backend processed/billed is input + cache fields.
+        prompt_total = input_tokens + cache_creation + cache_read
+        pricing = self.pricing_catalog.quote(backend_model, prompt_total, output_tokens)
         observed_tok_s = None
         if output_tokens > 0 and latency_ms > 0:
             observed_tok_s = output_tokens / (latency_ms / 1000)
@@ -124,7 +127,7 @@ class ObservabilityRecorder:
                 "cache_creation_input_tokens": cache_creation,
                 "cache_read_input_tokens": cache_read,
                 "usage_source": usage_source,
-                "total_tokens": input_tokens + output_tokens,
+                "total_tokens": prompt_total + output_tokens,
                 "input_cost": pricing["input_cost"],
                 "output_cost": pricing["output_cost"],
                 "estimated_cost": pricing["estimated_cost"],
@@ -153,6 +156,105 @@ class ObservabilityRecorder:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
             self.dropped_records += 1
+
+    def record_ensemble(
+        self,
+        *,
+        request_id: str,
+        session_id: Optional[str],
+        session_name: Optional[str],
+        mode: str,
+        candidates: List[Any],
+    ) -> None:
+        """Persist one ensemble race: a row per candidate with output preview,
+        verdict reasons, and who chose the winner (auto/user/timeout)."""
+        if not self.enabled or self._queue is None:
+            return
+        created_at = utc_now_iso()
+        rows = []
+        for cand in candidates:
+            usage = getattr(cand, "usage", None) or {}
+            score = getattr(cand, "score", 0.0)
+            rows.append(
+                {
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "session_name": session_name,
+                    "created_at": created_at,
+                    "mode": mode,
+                    "candidate_index": cand.index,
+                    "model": _truncate(cand.model, 200),
+                    "status": cand.status,
+                    "chosen_by": cand.chosen_by,
+                    "score": None if score == float("-inf") else score,
+                    "latency_ms": cand.latency_ms,
+                    "reasons": _truncate(json.dumps(cand.reasons, ensure_ascii=False), 2000),
+                    "finish_reason": cand.finish_reason,
+                    "output_text": _truncate(cand.output_text, 4000),
+                    "tool_calls": _truncate(
+                        json.dumps(cand.tool_calls, ensure_ascii=False), 4000
+                    ),
+                    "error": _truncate(cand.error, 500),
+                    "input_tokens": _as_int(usage.get("prompt_tokens")),
+                    "output_tokens": _as_int(usage.get("completion_tokens")),
+                }
+            )
+        try:
+            self._queue.put_nowait({"kind": "ensemble", "candidates": rows})
+        except asyncio.QueueFull:
+            self.dropped_records += 1
+
+    def fetch_ensemble_runs(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        session_name: Optional[str] = None,
+        limit: int = 120,
+    ) -> List[Dict[str, Any]]:
+        """Races for a session, newest first, grouped by request_id."""
+        if not self.enabled or not Path(self.db_path).exists():
+            return []
+        if session_name:
+            column, value = "session_name", session_name
+        elif session_id:
+            column, value = "session_id", session_id
+        else:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM ensemble_candidates
+                WHERE {column} = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (value, limit),
+            ).fetchall()
+
+        runs: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        for row in rows:
+            data = dict(row)
+            rid = data["request_id"]
+            if rid not in runs:
+                runs[rid] = {
+                    "request_id": rid,
+                    "created_at": data["created_at"],
+                    "mode": data["mode"],
+                    "candidates": [],
+                }
+                order.append(rid)
+            try:
+                data["reasons"] = json.loads(data.get("reasons") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                data["reasons"] = []
+            try:
+                data["tool_calls"] = json.loads(data.get("tool_calls") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                data["tool_calls"] = []
+            runs[rid]["candidates"].append(data)
+        for run in runs.values():
+            run["candidates"].sort(key=lambda c: c["candidate_index"])
+        return [runs[rid] for rid in order]
 
     def fetch_summary(self, *, hours: int = 24) -> Dict[str, Any]:
         if not self.enabled or not Path(self.db_path).exists():
@@ -592,10 +694,60 @@ class ObservabilityRecorder:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tool_calls_request ON tool_calls(request_id)"
             )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ensemble_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL,
+                    session_id TEXT,
+                    session_name TEXT,
+                    created_at TEXT NOT NULL,
+                    mode TEXT,
+                    candidate_index INTEGER NOT NULL,
+                    model TEXT,
+                    status TEXT,
+                    chosen_by TEXT,
+                    score REAL,
+                    latency_ms REAL,
+                    reasons TEXT,
+                    finish_reason TEXT,
+                    output_text TEXT,
+                    tool_calls TEXT,
+                    error TEXT,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0
+                )
+                """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ensemble_request ON ensemble_candidates(request_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ensemble_session_name ON ensemble_candidates(session_name)"
+            )
 
     def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
         with self._connect() as conn:
             for item in batch:
+                if item.get("kind") == "ensemble":
+                    for row in item["candidates"]:
+                        conn.execute(
+                            """
+                            INSERT INTO ensemble_candidates (
+                                request_id, session_id, session_name, created_at,
+                                mode, candidate_index, model, status, chosen_by,
+                                score, latency_ms, reasons, finish_reason,
+                                output_text, tool_calls, error,
+                                input_tokens, output_tokens
+                            ) VALUES (
+                                :request_id, :session_id, :session_name, :created_at,
+                                :mode, :candidate_index, :model, :status, :chosen_by,
+                                :score, :latency_ms, :reasons, :finish_reason,
+                                :output_text, :tool_calls, :error,
+                                :input_tokens, :output_tokens
+                            )
+                            """,
+                            row,
+                        )
+                    continue
                 request = item["request"]
                 conn.execute(
                     """

@@ -2,11 +2,12 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, Response
 
 from src.conversion.request_converter import _get_context_limit
 from src.core.config import config
 from src.core.model_manager import model_manager
+from src.ensemble.approval import approval_store
 from src.observability.store import observability_recorder
 
 router = APIRouter()
@@ -31,9 +32,10 @@ async def validate_dashboard_api_key(
         raise HTTPException(status_code=401, detail="Invalid API key.")
 
 
-@router.get("/dashboard", response_class=HTMLResponse)
+@router.get("/dashboard")
 async def dashboard(_: None = Depends(validate_dashboard_api_key)):
-    return HTMLResponse((STATIC_DIR / "dashboard.html").read_text(encoding="utf-8"))
+    html = (STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
+    return Response(content=html, media_type="text/html; charset=utf-8")
 
 
 @router.get("/dashboard/assets/{asset_name}")
@@ -44,7 +46,17 @@ async def dashboard_asset(asset_name: str, _: None = Depends(validate_dashboard_
     }
     if asset_name not in allowed:
         raise HTTPException(status_code=404, detail="Asset not found")
-    return FileResponse(STATIC_DIR / asset_name, media_type=allowed[asset_name])
+    return FileResponse(
+        STATIC_DIR / asset_name,
+        media_type=allowed[asset_name],
+        headers={"Cache-Control": "public, max-age=3600, must-revalidate"},
+    )
+
+
+@router.get("/dashboard/health")
+async def dashboard_health(_: None = Depends(validate_dashboard_api_key)):
+    """Quick endpoint for checking dashboard availability (useful for load balancers / Uptime Kuma)."""
+    return {"status": "ok", "version": "1.0"}
 
 
 @router.get("/api/observability/summary")
@@ -231,3 +243,45 @@ async def observability_context_usage(
         "percent": percentage,
         "model": claude_model or backend,
     }
+
+
+@router.get("/api/observability/ensemble/runs")
+async def ensemble_runs(
+    session_id: Optional[str] = Query(None),
+    session_name: Optional[str] = Query(None),
+    limit: int = Query(120, ge=1, le=500),
+    _: None = Depends(validate_dashboard_api_key),
+):
+    """Ensemble races for a session: per-candidate outputs, verdicts, winner."""
+    return {
+        "mode": config.ensemble_mode,
+        "models": config.ensemble_models,
+        "runs": observability_recorder.fetch_ensemble_runs(
+            session_id=session_id, session_name=session_name, limit=limit
+        ),
+    }
+
+
+@router.get("/api/observability/ensemble/pending")
+async def ensemble_pending(_: None = Depends(validate_dashboard_api_key)):
+    """Races currently held open waiting for the user's choice (approval mode)."""
+    return {"mode": config.ensemble_mode, "pending": approval_store.list_pending()}
+
+
+@router.post("/api/observability/ensemble/choose")
+async def ensemble_choose(
+    payload: dict,
+    _: None = Depends(validate_dashboard_api_key),
+):
+    """Resolve a pending approval: {'request_id': ..., 'candidate_index': N}."""
+    request_id = str(payload.get("request_id") or "")
+    try:
+        candidate_index = int(payload.get("candidate_index"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="candidate_index must be an integer")
+    if not approval_store.choose(request_id, candidate_index):
+        raise HTTPException(
+            status_code=404,
+            detail="No such pending approval (it may have timed out) or invalid candidate",
+        )
+    return {"ok": True, "request_id": request_id, "candidate_index": candidate_index}
