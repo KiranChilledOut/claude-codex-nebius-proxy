@@ -31,6 +31,9 @@ class InstallState:
     vision_model: str = ""
     shell_type: ShellType = ShellType.UNKNOWN
     shell_rc: str = ""
+    forced_shell_type: ShellType | None = None
+    forced_shell_rc: str = ""
+    mode: str = "claude"
     configure_shell: bool = True
     configure_statusline: bool = True
     statusline_exists: bool = False
@@ -332,14 +335,36 @@ def pick_default_models(available: list[str]) -> dict[str, str]:
     }
 
 
-def shell_function_is_present(shell_type: ShellType, rc_path: str) -> bool:
-    """Check if the claude shell function already exists in the profile."""
+def _claude_detect_patterns(shell_type: ShellType) -> list[str]:
+    if shell_type == ShellType.PWSH:
+        return ["function claude", "function global:claude"]
+    return ["claude() {"]
+
+
+def _codex_detect_patterns(shell_type: ShellType) -> list[str]:
+    if shell_type == ShellType.PWSH:
+        return ["function codex", "function global:codex"]
+    return ["codex() {"]
+
+
+def shell_function_is_present(
+    shell_type: ShellType,
+    rc_path: str,
+    mode: str = "claude",
+) -> bool:
+    """Check if the shell function already exists in the profile."""
     if not rc_path or not os.path.isfile(rc_path):
         return False
     content = pathlib.Path(rc_path).read_text(encoding="utf-8")
-    if shell_type == ShellType.PWSH:
-        return "function claude" in content or "function global:claude" in content
-    return "claude() {" in content
+    patterns = _codex_detect_patterns(shell_type) if mode == "codex" else _claude_detect_patterns(shell_type)
+    for line in content.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        for pat in patterns:
+            if pat in stripped:
+                return True
+    return False
 
 
 def append_shell_function(
@@ -347,6 +372,7 @@ def append_shell_function(
     rc_path: str,
     port: int,
     repo_root: pathlib.Path,
+    mode: str = "claude",
 ) -> bool:
     """Append the convenience shell function to the user's profile."""
     if not rc_path:
@@ -359,10 +385,16 @@ def append_shell_function(
     backup = f"{rc_path}.bak.{int(os.path.getmtime(rc_path))}"
     shutil.copy2(rc_path, backup)
 
-    if shell_type == ShellType.PWSH:
-        _append_pwsh(rc_path, port, repo_root)
+    if mode == "codex":
+        if shell_type == ShellType.PWSH:
+            _append_pwsh_codex(rc_path, port, repo_root)
+        else:
+            _append_bash_zsh_codex(rc_path, port, repo_root)
     else:
-        _append_bash_zsh(rc_path, port, repo_root)
+        if shell_type == ShellType.PWSH:
+            _append_pwsh(rc_path, port, repo_root)
+        else:
+            _append_bash_zsh(rc_path, port, repo_root)
 
     return True
 
@@ -374,6 +406,12 @@ claude() {{
     local main_proxy="http://localhost:{port}"
     local repo_root="{repo_root}"
     if [[ "$1" == "--proxy" ]]; then
+        shift
+        if [[ "$1" == "--voice" ]]; then
+            shift
+            python3 "$repo_root/scripts/claude-voice.py" --handsfree --proxy "$@"
+            return $?
+        fi
         printf "\\033[38;5;129m▐▛▜▌ Claude via Proxy\\033[0m  \\033[38;5;244m→ bearer auth via local proxy\\033[0m\\n"
         local default_name="session-$(date +%Y%m%d-%H%M%S)"
         printf "\\033[38;5;244mSession name\\033[0m [\\033[38;5;75m%s\\033[0m]: " "$default_name"
@@ -390,7 +428,7 @@ claude() {{
             unset ANTHROPIC_API_KEY
             export ANTHROPIC_AUTH_TOKEN="claude-local"
             export ANTHROPIC_BASE_URL="$forwarder_url"
-            command claude "${{@:2}}"
+            command claude "$@"
         )
         local claude_exit=$?
         kill "$forwarder_pid" 2>/dev/null || true
@@ -398,9 +436,11 @@ claude() {{
         return $claude_exit
     elif [[ "$1" == "--voice" ]]; then
         if [[ "$2" == "--proxy" ]]; then
-            python3 "$repo_root/scripts/claude-voice.py" --handsfree --proxy
+            shift 2
+            python3 "$repo_root/scripts/claude-voice.py" --handsfree --proxy "$@"
         else
-            python3 "$repo_root/scripts/claude-voice.py" --handsfree
+            shift
+            python3 "$repo_root/scripts/claude-voice.py" --handsfree "$@"
         fi
     else
         printf "\\033[38;5;46m▐▛▜▌ Claude Direct\\033[0m  \\033[38;5;244m→ subscription login auth\\033[0m\\n"
@@ -412,7 +452,7 @@ claude() {{
 }}
 alias claudius='claude --proxy'
 alias claudio='claude --voice'
-alias claudio-proxy='claude --voice --proxy'
+alias claudio-proxy='claude --proxy --voice'
 """
     with open(rc_path, "a", encoding="utf-8") as f:
         f.write(func)
@@ -430,38 +470,42 @@ function claude {{
     $oldApiKey = $env:ANTHROPIC_API_KEY
     $oldBaseUrl = $env:ANTHROPIC_BASE_URL
     if ($ClaudeArgs.Count -gt 0 -and $ClaudeArgs[0] -eq "--proxy") {{
-        Write-Host "`e[38;5;129m▐▛▜▌ Claude via Proxy`e[0m  `e[38;5;244m-> bearer auth via local proxy`e[0m"
-        $defaultName = "session-" + (Get-Date -Format "yyyyMMdd-HHmmss")
-        Write-Host "Session name [`e[38;5;75m$defaultName`e[0m]: " -NoNewline
-        [string] $sessionName = Read-Host
-        if ([string]::IsNullOrWhiteSpace($sessionName)) {{ $sessionName = $defaultName }}
-        [int] $localPort = python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()"
-        $forwarderJob = Start-Job -ScriptBlock {{
-            param($port, $target, $name, $repo)
-            python3 "$repo/scripts/session_forwarder.py" $port $target $name
-        }} -ArgumentList $localPort, "localhost:{port}", $sessionName, $repoRoot
-        Start-Sleep -Milliseconds 800
-        [string[]] $remainingArgs = @()
-        if ($ClaudeArgs.Count -gt 1) {{
-            $remainingArgs = [string[]] $ClaudeArgs[1..($ClaudeArgs.Count - 1)]
-        }}
-        $forwarderUrl = "http://localhost:$localPort"
-        try {{
-            $env:ANTHROPIC_AUTH_TOKEN = "claude-local"
-            Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
-            $env:ANTHROPIC_BASE_URL = $forwarderUrl
-            & $claudeCommand @remainingArgs
-        }} finally {{
-            if ($forwarderJob) {{ Stop-Job $forwarderJob -ErrorAction SilentlyContinue; Remove-Job $forwarderJob -ErrorAction SilentlyContinue }}
-            if ($null -eq $oldAuthToken) {{ Remove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_AUTH_TOKEN = $oldAuthToken }}
-            if ($null -eq $oldApiKey) {{ Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_API_KEY = $oldApiKey }}
-            if ($null -eq $oldBaseUrl) {{ Remove-Item Env:ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_BASE_URL = $oldBaseUrl }}
+        if ($ClaudeArgs.Count -gt 1 -and $ClaudeArgs[1] -eq "--voice") {{
+            [string[]] $voiceRem = [string[]] ($ClaudeArgs | Select-Object -Skip 2)
+            python3 "$repoRoot/scripts/claude-voice.py" --handsfree --proxy @voiceRem
+        }} else {{
+            Write-Host "`e[38;5;129m▐▛▜▌ Claude via Proxy`e[0m  `e[38;5;244m-> bearer auth via local proxy`e[0m"
+            $defaultName = "session-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+            Write-Host "Session name [`e[38;5;75m$defaultName`e[0m]: " -NoNewline
+            [string] $sessionName = Read-Host
+            if ([string]::IsNullOrWhiteSpace($sessionName)) {{ $sessionName = $defaultName }}
+            [int] $localPort = python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()"
+            $forwarderJob = Start-Job -ScriptBlock {{
+                param($port, $target, $name, $repo)
+                python3 "$repo/scripts/session_forwarder.py" $port $target $name
+            }} -ArgumentList $localPort, "localhost:{port}", $sessionName, $repoRoot
+            Start-Sleep -Milliseconds 800
+            $forwarderUrl = "http://localhost:$localPort"
+            try {{
+                $env:ANTHROPIC_AUTH_TOKEN = "claude-local"
+                Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+                $env:ANTHROPIC_BASE_URL = $forwarderUrl
+                [string[]] $remaining = [string[]] ($ClaudeArgs | Select-Object -Skip 1)
+                & $claudeCommand @remaining
+            }} finally {{
+                if ($forwarderJob) {{ Stop-Job $forwarderJob -ErrorAction SilentlyContinue; Remove-Job $forwarderJob -ErrorAction SilentlyContinue }}
+                if ($null -eq $oldAuthToken) {{ Remove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_AUTH_TOKEN = $oldAuthToken }}
+                if ($null -eq $oldApiKey) {{ Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_API_KEY = $oldApiKey }}
+                if ($null -eq $oldBaseUrl) {{ Remove-Item Env:ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_BASE_URL = $oldBaseUrl }}
+            }}
         }}
     }} elseif ($ClaudeArgs.Count -gt 0 -and $ClaudeArgs[0] -eq "--voice") {{
         if ($ClaudeArgs.Count -gt 1 -and $ClaudeArgs[1] -eq "--proxy") {{
-            python3 "$repoRoot/scripts/claude-voice.py" --handsfree --proxy
+            [string[]] $voiceRem = [string[]] ($ClaudeArgs | Select-Object -Skip 2)
+            python3 "$repoRoot/scripts/claude-voice.py" --handsfree --proxy @voiceRem
         }} else {{
-            python3 "$repoRoot/scripts/claude-voice.py" --handsfree
+            [string[]] $voiceRem = [string[]] ($ClaudeArgs | Select-Object -Skip 1)
+            python3 "$repoRoot/scripts/claude-voice.py" --handsfree @voiceRem
         }}
     }} else {{
         Write-Host "`e[38;5;46m▐▛▜▌ Claude Direct`e[0m  `e[38;5;244m-> subscription login auth`e[0m"
@@ -487,7 +531,88 @@ function claudio {{
 }}
 function claudio-proxy {{
     param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $ClaudeArgs)
-    claude --voice @(@("--proxy") + $ClaudeArgs)
+    claude --proxy @(@("--voice") + $ClaudeArgs)
+}}
+"""
+    with open(rc_path, "a", encoding="utf-8") as f:
+        f.write(func)
+
+
+def _get_api_key_from_env_dotenv(repo_root: pathlib.Path) -> str:
+    """Read OPENAI_API_KEY from the proxy's .env file."""
+    env_path = repo_root / ".env"
+    if not env_path.is_file():
+        return ""
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("OPENAI_API_KEY="):
+            val = line.split("=", 1)[1].strip().strip('"').strip("'")
+            return val
+    return ""
+
+
+def _append_bash_zsh_codex(rc_path: str, port: int, repo_root: pathlib.Path) -> None:
+    func = f"""
+# Codex Shell Function — enables codex, codex --proxy, and codexius
+codex() {{
+    local repo_root="{repo_root}"
+    if [[ "$1" == "--proxy" ]]; then
+        printf "\\033[38;5;129m▐▛▜▌ Codex via Proxy\\033[0m  \\033[38;5;244m→ Nebius backend\\033[0m\\n"
+        local api_key="${{OPENAI_API_KEY:-}}"
+        if [[ -z "$api_key" ]]; then
+            if [[ -f "$repo_root/.env" ]]; then
+                api_key=$(grep '^OPENAI_API_KEY=' "$repo_root/.env" | head -1 | sed 's/^OPENAI_API_KEY=//' | sed 's/^["'\\'']//' | sed 's/["'\\'']$//' | tr -d '\\t ')
+            fi
+        fi
+        if [[ -z "$api_key" ]]; then
+            echo "Error: OPENAI_API_KEY not set (set env var or add to $repo_root/.env)" >&2
+            return 1
+        fi
+        export OPENAI_API_KEY="$api_key"
+        command codex "${{@:2}}"
+    else
+        printf "\\033[38;5;46m▐▛▜▌ Codex Direct\\033[0m  \\033[38;5;244m→ standard auth\\033[0m\\n"
+        command codex "$@"
+    fi
+}}
+alias codexius='codex --proxy'
+"""
+    with open(rc_path, "a", encoding="utf-8") as f:
+        f.write(func)
+
+
+def _append_pwsh_codex(rc_path: str, port: int, repo_root: pathlib.Path) -> None:
+    func = f"""
+# Codex Shell Function - enables codex, codex --proxy, and codexius
+function codex {{
+    param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $CodexArgs)
+    $repoRoot = "{repo_root}"
+    $codexCommand = (Get-Command codex -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    if ($CodexArgs.Count -gt 0 -and $CodexArgs[0] -eq "--proxy") {{
+        $apiKey = $env:OPENAI_API_KEY
+        if (-not $apiKey -and (Test-Path "$repoRoot/.env")) {{
+            $line = Select-String -Path "$repoRoot/.env" -Pattern "^OPENAI_API_KEY=" | Select-Object -First 1
+            if ($line) {{ $apiKey = ($line.Line -replace '^OPENAI_API_KEY=', '').Trim('"', ' ', "`t") }}
+        }}
+        if (-not $apiKey) {{
+            Write-Host "▐▛▜▌ Error`e[0m  `e[38;5;244m-> OPENAI_API_KEY not set (set env var or add to $repoRoot/.env)`e[0m" -ForegroundColor Red
+            return
+        }}
+        $env:OPENAI_API_KEY = $apiKey
+        Write-Host "`e[38;5;129m▐▛▜▌ Codex via Proxy`e[0m  `e[38;5;244m-> Nebius backend`e[0m"
+        $remainingArgs = [string[]] @()
+        if ($CodexArgs.Count -gt 1) {{
+            $remainingArgs = [string[]] $CodexArgs[1..($CodexArgs.Count - 1)]
+        }}
+        & $codexCommand @remainingArgs
+    }} else {{
+        Write-Host "`e[38;5;46m▐▛▜▌ Codex Direct`e[0m  `e[38;5;244m-> standard auth`e[0m"
+        & $codexCommand @CodexArgs
+    }}
+}}
+function codexius {{
+    param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $CodexArgs)
+    codex --proxy @CodexArgs
 }}
 """
     with open(rc_path, "a", encoding="utf-8") as f:

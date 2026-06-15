@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Installer TUI: WelcomeScreen now offers **three buttons**: "Claude →", "Codex →", "Shell Profile →".
+  Choosing a mode sets `InstallState.mode` ("claude" | "codex"). Codex mode appends `codex()` /
+  `codexius` shell functions and aliases instead of Claude ones. `ShellScreen` checkbox label
+  and preview text adapt to the active mode. The "Shell Profile" button lets the user pre-pick
+  a shell (zsh / bash / pwsh) before continuing; Continue returns to the WelcomeScreen.
+
+### Fixed
+- `shell_function_is_present` now skips `#`-prefixed lines, preventing false-positive matches
+  against commented-out shell function blocks in profiles. Previously it found a commented-out
+  `function claude` in a PowerShell profile and incorrectly declared the profile "already
+  configured".
+
+### Changed
+- Codex proxy improvements: added request converter foundations, model mapping, and Pydantic models.
+
+### Added
 - Voice integration: full TTS, STT, and voice profile support via `/voice/*`
   endpoints. Provider discovery (Kokoro, Whisper, OpenAI), failover, streaming
   playback, and filesystem-based voice cloning (`~/.claude/voice/profiles`).

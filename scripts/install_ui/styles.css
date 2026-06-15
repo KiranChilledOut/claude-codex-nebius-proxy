@@ -57,6 +57,42 @@ Static.form_label {
     margin-top: 1;
 }
 
+Static.section_label {
+    text-align: center;
+    color: rgb(200,200,200);
+    text-style: bold;
+    width: 100%;
+}
+
+/* ── Mode cards (welcome screen) ──────────────────────────── */
+.mode_card {
+    width: 100%;
+    height: auto;
+    border: solid #2e2e2e;
+    padding: 0 1;
+    margin: 0 0;
+}
+
+.mode_card:focus-within {
+    border: solid rgb(0,188,212);
+}
+
+.mode_row {
+    layout: horizontal;
+    height: auto;
+    align: left middle;
+}
+
+.mode_row Button {
+    width: 16;
+    content-align: center middle;
+}
+
+.mode_row Static {
+    content-align: center middle;
+    width: 100%;
+}
+
 # ── Buttons ────────────────────────────────────────────────────
 .button_bar {
     layout: horizontal;
@@ -104,6 +140,19 @@ RichLog {
 Markdown {
     width: 76;
     height: auto;
+}
+
+# ── Profile picker rows ──────────────────────────────────────
+.profile_row {
+    layout: horizontal;
+    height: auto;
+    align: left middle;
+    margin: 0 0;
+}
+
+.profile_row Static {
+    content-align: center middle;
+    width: 100%;
 }
 
 # ── Modal ──────────────────────────────────────────────────────

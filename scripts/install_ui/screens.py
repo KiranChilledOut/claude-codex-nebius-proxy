@@ -136,30 +136,267 @@ class WelcomeScreen(Screen):
         with Container(classes="content_panel", id="welcome_content"):
             yield Static(
                 "\n"
-                "    ▐▛▜▌  Claude Code Proxy\n"
-                "    ────────────────────────\n",
+                "      ▐▛▜▌  Claude Code Proxy\n"
+                "      ═════════════════════════\n",
                 classes="banner",
             )
-            yield Static("powered by Nebius Token Factory", classes="subtitle")
-            yield Static("", classes="info_label")
-            yield Markdown(
-                ""
-                "This wizard will:\n"
-                "-  Check your system\n"
-                "-  Set up a Python environment\n"
-                "-  Connect to your Nebius API\n"
-                "-  Configure shell shortcuts & statusline\n",
-            )
+            yield Static("  Powered by Nebius Token Factory", classes="subtitle")
+            yield Static("")
+            yield Static("  What would you like to configure?", classes="section_label")
+            yield Static("")
+
+            # Mode cards
+            with Container(classes="mode_card", id="card_claude"):
+                with Horizontal(classes="mode_row"):
+                    yield Button("Claude", id="btn_claude")
+                    yield Static(
+                        "  [dim]Anthropic Claude Code  →  Nebius[/]  "
+                        "[dim](proxy + voice ready)[/]",
+                        id="desc_claude",
+                    )
+            with Container(classes="mode_card", id="card_codex"):
+                with Horizontal(classes="mode_row"):
+                    yield Button("Codex", id="btn_codex")
+                    yield Static(
+                        "  [dim]OpenAI / Codex / GPT  →  Nebius[/]  "
+                        "[dim](Responses API proxy)[/]",
+                        id="desc_codex",
+                    )
+            with Container(classes="mode_card", id="card_profile"):
+                with Horizontal(classes="mode_row"):
+                    yield Button("Shell Profile", id="btn_profile")
+                    yield Static(
+                        "  [dim]Choose which shell profile to target[/]  "
+                        "[dim](zsh / bash / pwsh)[/]",
+                        id="desc_profile",
+                    )
+
+            yield Static("")
+            yield Static("", id="selection_status")
+            yield Static("")
+
         with Horizontal(classes="button_bar"):
-            yield Button("Start  →", variant="success", id="start")
             yield Button("Quit", variant="error", id="quit")
+            yield Button("←  Back", disabled=True, id="back")
+            yield Button("Continue  →", variant="success", disabled=True, id="next")
+
+    def on_mount(self) -> None:
+        s = self.app.state
+        status = self.query_one("#selection_status", Static)
+        parts: list[str] = []
+        if s.mode:
+            self._highlight(s.mode)
+            self.query_one("#next", Button).disabled = False
+            parts.append(f"[green]✔  {s.mode.title()} mode[/]")
+        if s.forced_shell_type is not None:
+            parts.append(
+                f"[dim]Profile: {s.forced_shell_type.value} → "
+                f"{s.forced_shell_rc}[/]"
+            )
+        if parts:
+            status.update("  |  ".join(parts))
+
+    def _highlight(self, mode: str) -> None:
+        """Underline the active card, dim the rest."""
+        for key, raw in (
+            ("claude", "Anthropic Claude Code"),
+            ("codex", "OpenAI / Codex / GPT"),
+            ("profile", "Choose which shell profile to target"),
+        ):
+            try:
+                if key == mode:
+                    if key == "profile":
+                        text = (
+                            f"  [bold][underline]{raw}[/]  →  "
+                            f"[dim]zsh / bash / pwsh[/]"
+                        )
+                    else:
+                        target = (
+                            "Nebius (proxy + voice ready)"
+                            if key == "claude"
+                            else "Nebius (Responses API proxy)"
+                        )
+                        text = (
+                            f"  [bold][underline]{raw}[/]  →  "
+                            f"[dim]{target}[/]"
+                        )
+                else:
+                    if key == "profile":
+                        text = (
+                            f"  {raw}  →  "
+                            f"[dim]zsh / bash / pwsh[/]"
+                        )
+                    else:
+                        target = (
+                            "Nebius (proxy + voice ready)"
+                            if key == "claude"
+                            else "Nebius (Responses API proxy)"
+                        )
+                        text = (
+                            f"  {raw}  →  "
+                            f"[dim]{target}[/]"
+                        )
+                self.query_one(f"#desc_{key}", Static).update(text)
+            except Exception:
+                pass
 
     @on(Button.Pressed)
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "start":
+        eid = event.button.id or ""
+        state = self.app.state
+        status = self.query_one("#selection_status", Static)
+
+        if eid == "btn_claude":
+            state.mode = "claude"
+            self._highlight("claude")
+            self.query_one("#next", Button).disabled = False
+            parts = ["[green]✔  Claude mode[/]"]
+            if state.forced_shell_type is not None:
+                parts.append(
+                    f"[dim]Profile: {state.forced_shell_type.value} → "
+                    f"{state.forced_shell_rc}[/]"
+                )
+            status.update("  |  ".join(parts))
+        elif eid == "btn_codex":
+            state.mode = "codex"
+            self._highlight("codex")
+            self.query_one("#next", Button).disabled = False
+            parts = ["[green]✔  Codex mode[/]"]
+            if state.forced_shell_type is not None:
+                parts.append(
+                    f"[dim]Profile: {state.forced_shell_type.value} → "
+                    f"{state.forced_shell_rc}[/]"
+                )
+            status.update("  |  ".join(parts))
+        elif eid == "btn_profile":
+            self.app.push_screen(ProfileScreen())
+        elif eid == "next":
             self.app.push_screen(PrerequisiteScreen())
-        elif event.button.id == "quit":
+        elif eid == "quit":
             self.app.exit()
+
+
+# ─── 1a. Profile Picker ──────────────────────────────────────
+
+class ProfileScreen(Screen):
+    """Pick shell profile: zshrc / bashrc / pwsh — or auto-detect."""
+
+    def _pwsh_profile(self) -> str:
+        try:
+            result = subprocess.run(
+                ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$PROFILE"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.stdout.strip().splitlines()[-1].strip()
+        except Exception:
+            return ""
+
+    def compose(self) -> ComposeResult:
+        yield Static("Shell Profile Configuration", classes="step_header")
+        with Container(classes="content_panel", id="profile_content"):
+            yield Static(
+                "Which shell profile should the wizard configure?\n"
+                "(Choose 'Auto-detect' to let the wizard detect your current shell.)",
+                classes="hint_label",
+            )
+            yield Static("")
+
+            # Candidate rows — each with a button + path label
+            yield Horizontal(
+                Button("Select", id="pick_zsh"),
+                Static("  [bold]zsh[/]  →  [dim]~/.zshrc[/]", id="label_zsh"),
+                classes="profile_row",
+            )
+            yield Horizontal(
+                Button("Select", id="pick_bash"),
+                Static("  [bold]bash[/]  →  [dim]~/.bashrc[/]", id="label_bash"),
+                classes="profile_row",
+            )
+
+            pwsh_path = self._pwsh_profile()
+            if pwsh_path:
+                yield Horizontal(
+                    Button("Select", id="pick_pwsh"),
+                    Static(f"  [bold]PowerShell[/]  →  [dim]{pwsh_path}[/]", id="label_pwsh"),
+                    classes="profile_row",
+                )
+            else:
+                yield Horizontal(
+                    Button("Select", disabled=True, id="pick_pwsh"),
+                    Static("  [bold]PowerShell[/]  →  [dim]pwsh not found[/]", id="label_pwsh"),
+                    classes="profile_row",
+                )
+
+            yield Static("")
+            yield Horizontal(
+                Button("Use Auto-detect", variant="primary", id="pick_auto"),
+                Static("  Let the wizard detect your shell automatically.", id="label_auto"),
+                classes="profile_row",
+            )
+            yield Static("")
+            yield Static("", id="selection_status")
+
+        with Horizontal(classes="button_bar"):
+            yield Button("←  Back", id="back")
+            yield Button("Continue  →", variant="success", id="next")
+
+    @on(Button.Pressed)
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        eid = event.button.id or ""
+        state = self.app.state
+        status = self.query_one("#selection_status", Static)
+
+        # Labels reset to normal, then one gets underlined
+        pwsh_path = self._pwsh_profile()
+        pwsh_label = pwsh_path if pwsh_path else "pwsh not found"
+        labels: dict[str, str] = {
+            "zsh":  "  [bold]zsh[/]  →  [dim]~/.zshrc[/]",
+            "bash": "  [bold]bash[/]  →  [dim]~/.bashrc[/]",
+            "pwsh": f"  [bold]PowerShell[/]  →  [dim]{pwsh_label}[/]",
+            "auto": "  Let the wizard detect your shell automatically.",
+        }
+
+        for key, text in labels.items():
+            try:
+                self.query_one(f"#label_{key}", Static).update(text)
+            except Exception:
+                pass
+
+        if eid == "pick_zsh":
+            state.forced_shell_type = ShellType.ZSH
+            state.forced_shell_rc = os.path.expanduser("~/.zshrc")
+            self.query_one("#label_zsh", Static).update(
+                "  [bold][underline]zsh[/]  →  [dim]~/.zshrc[/]"
+            )
+            status.update(f"[green]✔  Will configure [bold]~/.zshrc[/][/]")
+        elif eid == "pick_bash":
+            state.forced_shell_type = ShellType.BASH
+            state.forced_shell_rc = os.path.expanduser("~/.bashrc")
+            self.query_one("#label_bash", Static).update(
+                "  [bold][underline]bash[/]  →  [dim]~/.bashrc[/]"
+            )
+            status.update(f"[green]✔  Will configure [bold]~/.bashrc[/][/]")
+        elif eid == "pick_pwsh":
+            if pwsh_path:
+                state.forced_shell_type = ShellType.PWSH
+                state.forced_shell_rc = pwsh_path
+                self.query_one("#label_pwsh", Static).update(
+                    f"  [bold][underline]PowerShell[/]  →  [dim]{pwsh_path}[/]"
+                )
+                status.update(f"[green]✔  Will configure [bold]{pwsh_path}[/][/]")
+        elif eid == "pick_auto":
+            state.forced_shell_type = None
+            state.forced_shell_rc = ""
+            self.query_one("#label_auto", Static).update(
+                "  [bold][underline]Auto-detect[/]: Let the wizard detect your shell automatically."
+            )
+            status.update("[dim]Will auto-detect your shell at configuration time.[/]")
+        elif eid == "back":
+            self.app.pop_screen()
+        elif eid == "next":
+            self.app.pop_screen()
 
 
 # ─── 2. Prerequisites ──────────────────────────────────────────
@@ -686,11 +923,13 @@ class ShellScreen(Screen):
     _already_present: bool = False
 
     def compose(self) -> ComposeResult:
+        mode = self.app.state.mode
+        label = self._mode_label(mode)
         yield Static("[8 / 10]  Shell Shortcuts", classes="step_header")
         with Container(classes="content_panel", id="shell_content"):
             yield Static("", id="detected")
             yield Checkbox(
-                "Add claude and claudius shortcuts to my shell profile",
+                label,
                 value=True,
                 id="do_shell",
             )
@@ -699,26 +938,49 @@ class ShellScreen(Screen):
             yield Button("←  Back", id="back")
             yield Button("Continue  →", variant="success", id="next")
 
+    def _mode_label(self, mode: str) -> str:
+        if mode == "codex":
+            return "Add codex and codexius shortcuts to my shell profile"
+        return "Add claude and claudius shortcuts to my shell profile"
+
+    def _mode_func_name(self, mode: str) -> str:
+        return "codex" if mode == "codex" else "claude"
+
     def on_mount(self) -> None:
         s = self.app.state
-        shell_type, shell_rc = detect_shell()
-        s.shell_type, s.shell_rc = shell_type, shell_rc
         detected = self.query_one("#detected", Static)
         preview = self.query_one("#preview", Static)
+
+        # If user forced a shell profile from the ProfileScreen, use it.
+        # Otherwise fall back to auto-detect.
+        if s.forced_shell_type is not None:
+            shell_type, shell_rc = s.forced_shell_type, s.forced_shell_rc
+        else:
+            shell_type, shell_rc = detect_shell()
+
+        s.shell_type, s.shell_rc = shell_type, shell_rc
+
         if shell_type == ShellType.UNKNOWN or not shell_rc:
-            detected.update("[yellow]⚠  Could not detect shell[/]")
+            detected.update("[yellow]⚠  Could not determine shell profile[/]")
             self.query_one("#do_shell", Checkbox).value = False
             self.query_one("#do_shell", Checkbox).disabled = True
             preview.update("[dim]Skip this step; configure manually later.[/dim]")
             return
-        detected.update(f"Detected: [bold]{shell_type.value}[/]  →  [dim]{shell_rc}[/]")
-        self._already_present = shell_function_is_present(shell_type, shell_rc)
+
+        if s.forced_shell_type is not None:
+            detected.update(f"Selected: [bold]{shell_type.value}[/]  →  [dim]{shell_rc}[/]")
+        else:
+            detected.update(f"Detected: [bold]{shell_type.value}[/]  →  [dim]{shell_rc}[/]")
+        self._already_present = shell_function_is_present(
+            shell_type, shell_rc, s.mode,
+        )
+        func_name = self._mode_func_name(s.mode)
         if self._already_present:
             preview.update("[green]✔  Already configured — nothing to add[/]")
             self.query_one("#do_shell", Checkbox).value = False
             self.query_one("#do_shell", Checkbox).disabled = True
         else:
-            preview.update(f"[dim]Adds claude() function to {shell_rc}[/dim]")
+            preview.update(f"[dim]Adds {func_name}() function to {shell_rc}[/dim]")
 
     @on(Button.Pressed)
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -730,6 +992,7 @@ class ShellScreen(Screen):
                     self.app.state.shell_rc,
                     self.app.state.port,
                     get_repo_root(),
+                    self.app.state.mode,
                 )
             self.app.push_screen(StatuslineScreen())
         elif event.button.id == "back":
