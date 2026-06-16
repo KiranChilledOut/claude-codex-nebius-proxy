@@ -46,7 +46,7 @@ If you prefer not to use the TUI:
 
 ```bash
 # 1. Clone and enter directory
-cd claude-code-proxy
+cd claude-codex-nebius-proxy
 
 # 2. Create venv & install deps
 python3 -m venv .venv
@@ -120,15 +120,15 @@ See [docs/codex/CODEX_STATUSLINE.md](docs/codex/CODEX_STATUSLINE.md) for full st
 
 For full configuration options, model details, architecture, troubleshooting, and the complete feature list, see **[docs/README.md](docs/README.md)**.
 
-| Doc | What's inside |
-|-----|-------------|
-| [docs/README.md](docs/README.md) | Full reference index — everything |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System flow, key files, design |
-| [docs/TOOL_CALL_FORMAT.md](docs/TOOL_CALL_FORMAT.md) | Claude SSE tool-call streaming |
-| [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) | Dashboard configuration |
-| [docs/SHELL_FUNCTION.md](docs/SHELL_FUNCTION.md) | Shell shortcut reference |
-| [docs/BINARY_PACKAGING.md](docs/BINARY_PACKAGING.md) | Standalone binary notes |
-| [docs/MANUAL_SETUP.md](docs/MANUAL_SETUP.md) | Manual setup (skip the TUI) |
+| Doc                                                              | What's inside                                 |
+| ---------------------------------------------------------------- | --------------------------------------------- |
+| [docs/README.md](docs/README.md)                                 | Full reference index — everything             |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)                     | System flow, key files, design                |
+| [docs/TOOL_CALL_FORMAT.md](docs/TOOL_CALL_FORMAT.md)             | Claude SSE tool-call streaming                |
+| [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)                   | Dashboard configuration                       |
+| [docs/SHELL_FUNCTION.md](docs/SHELL_FUNCTION.md)                 | Shell shortcut reference                      |
+| [docs/BINARY_PACKAGING.md](docs/BINARY_PACKAGING.md)             | Standalone binary notes                       |
+| [docs/MANUAL_SETUP.md](docs/MANUAL_SETUP.md)                     | Manual setup (skip the TUI)                   |
 | [docs/codex/CODEX_STATUSLINE.md](docs/codex/CODEX_STATUSLINE.md) | Codex CLI proxy routing and statusline config |
 
 ## Features (high-level)

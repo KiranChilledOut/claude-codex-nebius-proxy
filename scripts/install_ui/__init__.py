@@ -1,1 +1,1 @@
-"""Textual TUI installer for claude-code-proxy."""
+"""Textual TUI installer for claude-codex-nebius-proxy."""

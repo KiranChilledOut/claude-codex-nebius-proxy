@@ -294,15 +294,6 @@ def convert_responses_to_openai_chat(
             result["tools"] = request.tools
             if request.tool_choice is not None:
                 result["tool_choice"] = request.tool_choice
-    # Tool choice passthrough when tool_ctx is absent
-    if tool_ctx is None and request.tool_choice is not None:
-        if isinstance(request.tool_choice, str):
-            if request.tool_choice in ("auto", "required", "none"):
-                result["tool_choice"] = request.tool_choice
-        else:
-            # Object form — passthrough as-is when not handled by tool_ctx
-            result["tool_choice"] = request.tool_choice
-
     # Vision endpoints commonly reject tool use; mirror the Claude image path.
     if has_image:
         result.pop("tools", None)

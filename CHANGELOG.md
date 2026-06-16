@@ -19,9 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Quality of Life
 - Dashboard root (`/dashboard`) content-type is now explicitly `text/html; charset=utf-8`.
+- TUI installer wizard streamlined from 10 → 8 steps. Consolidates Shell, Codex CLI, and Claude Code configuration into a single "Configure Your Setup" screen with checkboxes — no more navigating four separate screens to enable what you want. Removed `ShellScreen`, `CodexConfigScreen`, and `StatuslineScreen`; new `ConfigurationScreen` groups everything together.
+- Shell shortcuts now detect **all available profiles** (`.bashrc`, `.zshrc`, PowerShell `$PROFILE`, Warp) and shows a checkbox for each — user can pick individually which profiles to write to.
+- Docker commands now appear on the **Done screen** (as an alternative run option), not as a config checkbox. The Smoke Test already has the proxy running, so Docker wouldn't make sense as "configure" option.
 
 ### Fixed
 - Missing `from src.core.config import config` in `tests/test_observability.py` — the `client` fixture monkeypatches `config.ignore_client_api_key` but `config` was never imported, causing `NameError` at test collection.
+- Fixed 400 error "When using `tool_choice`, `tools` must be set" from Codex requests. The codex request converter was unconditionally adding `tool_choice` to OpenAI requests even when `tools` was absent, causing Nebius backend to reject the request. Now `tool_choice` is only forwarded when tools are present.
 - Streaming responses now report real provider token usage instead of zeros.
   The stream converter exited at `finish_reason` before the trailing
   empty-choices usage chunk (sent by `stream_options.include_usage`) arrived;

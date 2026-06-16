@@ -128,3 +128,10 @@ OverwriteStatuslineModal .modal_text {
     color: rgb(200,200,200);
     width: 100%;
 }
+
+.section_header {
+    text-align: left;
+    width: 100%;
+    margin-top: 1;
+    margin-bottom: 0;
+}

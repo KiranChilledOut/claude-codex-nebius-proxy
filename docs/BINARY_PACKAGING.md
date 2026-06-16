@@ -25,7 +25,7 @@ uv run pyinstaller claude-proxy.spec
 Single-file build:
 
 ```bash
-uv run pyinstaller --onefile --name claude-code-proxy-single src/main.py
+uv run pyinstaller --onefile --name claude-codex-nebius-proxy-single src/main.py
 ```
 
 ## Cross-Platform Note

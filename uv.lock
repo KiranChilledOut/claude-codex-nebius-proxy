@@ -349,7 +349,7 @@ wheels = [
 ]
 
 [[package]]
-name = "claude-code-proxy-nebius"
+name = "claude-codex-nebius-proxy-nebius"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [

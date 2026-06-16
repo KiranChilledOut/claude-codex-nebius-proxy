@@ -6,12 +6,12 @@ The TUI installer (`./install.sh`) can automatically append the most recent vers
 
 ## Claude Code
 
-| Command | Description |
-|---------|-------------|
-| `claude` | Direct Claude Code (subscription login) |
-| `claude --proxy` | Proxy mode via Nebius with session forwarder |
-| `claude --proxy <dir>` | Proxy mode starting in a specific directory |
-| `claudius` | Alias for `claude --proxy` |
+| Command                | Description                                  |
+| ---------------------- | -------------------------------------------- |
+| `claude`               | Direct Claude Code (subscription login)      |
+| `claude --proxy`       | Proxy mode via Nebius with session forwarder |
+| `claude --proxy <dir>` | Proxy mode starting in a specific directory  |
+| `claudius`             | Alias for `claude --proxy`                   |
 
 ### Session Forwarder
 
@@ -30,11 +30,11 @@ Forwarder output (including network errors) is written to `logs/session-forwarde
 
 ## Codex CLI
 
-| Command | Description |
-|---------|-------------|
-| `codex` | Direct Codex CLI (standard OpenAI auth) |
+| Command         | Description                                             |
+| --------------- | ------------------------------------------------------- |
+| `codex`         | Direct Codex CLI (standard OpenAI auth)                 |
 | `codex --proxy` | Proxy mode via Nebius (sets OPENAI_API_KEY from `.env`) |
-| `codexius` | Alias for `codex --proxy` |
+| `codexius`      | Alias for `codex --proxy`                               |
 
 ### Environment Variables
 
@@ -52,7 +52,7 @@ The `codex --proxy` function reads your `OPENAI_API_KEY` from the environment or
 ### Proxy not running?
 
 ```bash
-cd /path/to/claude-code-proxy
+cd /path/to/claude-codex-nebius-proxy
 .venv/bin/python start_proxy.py
 ```
 
