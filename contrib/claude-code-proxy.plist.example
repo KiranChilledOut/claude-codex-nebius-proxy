@@ -1,19 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  launchd agent that keeps claude-code-proxy running on macOS.
+  launchd agent that keeps claude-codex-nebius-proxy running on macOS.
 
   Install:
     1. Replace REPO_ROOT below with the absolute path to your clone, e.g.
-       /Users/you/src/claude-code-proxy
-    2. cp contrib/claude-code-proxy.plist.example \
-         ~/Library/LaunchAgents/com.user.claude-code-proxy.plist
-    3. launchctl load ~/Library/LaunchAgents/com.user.claude-code-proxy.plist
+       /Users/you/src/claude-codex-nebius-proxy
+    2. cp contrib/claude-codex-nebius-proxy.plist.example \
+         ~/Library/LaunchAgents/com.user.claude-codex-nebius-proxy.plist
+    3. launchctl load ~/Library/LaunchAgents/com.user.claude-codex-nebius-proxy.plist
 
   Stop / unload:
-    launchctl unload ~/Library/LaunchAgents/com.user.claude-code-proxy.plist
+    launchctl unload ~/Library/LaunchAgents/com.user.claude-codex-nebius-proxy.plist
 
   Logs:
-    tail -f /tmp/claude-code-proxy.log
+    tail -f /tmp/claude-codex-nebius-proxy.log
 
   This is a user-level LaunchAgent (runs at login, dies at logout). Use
   /Library/LaunchDaemons + sudo if you need a system-wide variant.
@@ -23,7 +23,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.user.claude-code-proxy</string>
+  <string>com.user.claude-codex-nebius-proxy</string>
 
   <key>ProgramArguments</key>
   <array>
@@ -41,9 +41,9 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/tmp/claude-code-proxy.log</string>
+  <string>/tmp/claude-codex-nebius-proxy.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/tmp/claude-code-proxy.log</string>
+  <string>/tmp/claude-codex-nebius-proxy.log</string>
 </dict>
 </plist>

@@ -1,4 +1,4 @@
-"""Textual screens for the claude-code-proxy installer wizard."""
+"""Textual screens for the claude-codex-nebius-proxy installer wizard."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import platform
+import shutil
 import socket
 import subprocess
 import sys
@@ -28,12 +29,12 @@ from textual.widgets import (
 )
 
 from .utils import (
-    ClientChoice,
     InstallState,
     ShellType,
     append_shell_function,
     detect_shell,
     fetch_nebius_models,
+    get_all_shell_profiles,
     get_claude_settings_path,
     get_codex_config_path,
     get_repo_root,
@@ -111,7 +112,7 @@ class WizardStep(Container):
     content_id: str = "content"
 
     def compose(self) -> ComposeResult:
-        yield Static(f"[{self.step_num} / 10]  {self.step_title}", classes="step_header")
+        yield Static(f"[{self.step_num} / 8]  {self.step_title}", classes="step_header")
         with Container(classes="content_panel", id=self.content_id):
             yield None        # subclasses override compose_content
         with Horizontal(classes="button_bar"):
@@ -151,22 +152,15 @@ class WelcomeScreen(Screen):
                 "-  Check your system\n"
                 "-  Set up a Python environment\n"
                 "-  Connect to your Nebius API\n"
-                "-  Configure shell shortcuts & statusline\n"
-                "-  Set up your chosen client (Claude or Codex)\n",
+                "-  Configure your clients in one step\n",
             )
-            yield Static("\nWhich client do you want to configure?", classes="info_label")
+            yield Static("\nReady to set up your proxy?", classes="info_label")
         with Horizontal(classes="button_bar"):
-            yield Button("Configure Claude Code", variant="success", id="claude")
-            yield Button("Configure Codex CLI", variant="primary", id="codex")
+            yield Button("Start Setup  ▶", variant="success", id="start")
 
     @on(Button.Pressed)
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "claude":
-            self.app.state.client = ClientChoice.CLAUDE
-            self.app.push_screen(PrerequisiteScreen())
-        elif event.button.id == "codex":
-            self.app.state.client = ClientChoice.CODEX
-            self.app.push_screen(PrerequisiteScreen())
+        self.app.push_screen(PrerequisiteScreen())
 
 
 # ─── 2. Prerequisites ──────────────────────────────────────────
@@ -176,7 +170,7 @@ class PrerequisiteScreen(Screen):
     results: reactive[dict[str, tuple[bool, str]]] = reactive({}, always_update=True)
 
     def compose(self) -> ComposeResult:
-        yield Static("[1 / 10]  Checking Prerequisites", classes="step_header")
+        yield Static("[1 / 8]  Checking Prerequisites", classes="step_header")
         with Container(classes="content_panel", id="prereq_content"):
             yield Static("Validating your system …", id="status")
             yield Static("", id="output")
@@ -234,7 +228,7 @@ class VenvScreen(Screen):
     _done: bool = False
 
     def compose(self) -> ComposeResult:
-        yield Static("[2 / 10]  Virtual Environment", classes="step_header")
+        yield Static("[2 / 8]  Virtual Environment", classes="step_header")
         with Container(classes="content_panel", id="venv_content"):
             yield Static("Setting up Python environment …", id="status")
             yield ProgressBar(total=100, id="progress")
@@ -277,7 +271,7 @@ class DepsScreen(Screen):
     _done: bool = False
 
     def compose(self) -> ComposeResult:
-        yield Static("[3 / 10]  Installing Dependencies", classes="step_header")
+        yield Static("[3 / 8]  Installing Dependencies", classes="step_header")
         with Container(classes="content_panel", id="deps_content"):
             yield Static("Installing packages …", id="status")
             yield ProgressBar(total=100, id="progress")
@@ -346,7 +340,7 @@ class ApiKeyScreen(Screen):
             self.query_one("#port", Input).value = env_port
 
     def compose(self) -> ComposeResult:
-        yield Static("[4 / 10]  API Key & Port", classes="step_header")
+        yield Static("[4 / 8]  API Key & Port", classes="step_header")
         with Container(classes="content_panel", id="api_content"):
             yield Static("Nebius API Key:", classes="form_label")
             yield Input(
@@ -469,7 +463,7 @@ class ModelScreen(Screen):
         return defaults
 
     def compose(self) -> ComposeResult:
-        yield Static("[5 / 10]  Model Selection", classes="step_header")
+        yield Static("[5 / 8]  Model Selection", classes="step_header")
         with Container(classes="content_panel", id="model_content"):
             yield Static("Fetching available models from Nebius …", id="status")
             yield ProgressBar(total=100, id="progress")
@@ -554,7 +548,7 @@ class ReviewScreen(Screen):
             sel.value = default if default in models else models[0]
 
     def compose(self) -> ComposeResult:
-        yield Static("[6 / 10]  Review Your Choices", classes="step_header")
+        yield Static("[6 / 8]  Review Your Choices", classes="step_header")
         with Container(classes="content_panel", id="review_content"):
             yield Static(
                 "Pick your models from the dropdowns below. "
@@ -601,7 +595,7 @@ class SmokeScreen(Screen):
     _passed: bool = False
 
     def compose(self) -> ComposeResult:
-        yield Static("[7 / 10]  Smoke Test", classes="step_header")
+        yield Static("[7 / 8]  Smoke Test", classes="step_header")
         with Container(classes="content_panel", id="smoke_content"):
             yield Static(
                 "Start the proxy in another terminal, then press Test.",
@@ -676,7 +670,7 @@ class SmokeScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         eid = event.button.id or ""
         if eid == "next" and self._passed:
-            self.app.push_screen(ShellScreen())
+            self.app.push_screen(ConfigurationScreen())
         elif eid == "back":
             self.app.pop_screen()
         elif eid == "btn_test":
@@ -686,136 +680,11 @@ class SmokeScreen(Screen):
             self._test_proxy()
 
 
-# ─── 9. Shell Config ───────────────────────────────────────────
+# ─── 8. Configuration (Consolidated) ───────────────────────────
 
-class ShellScreen(Screen):
+class ConfigurationScreen(Screen):
+    """Single-screen config: Claude ✓ Codex ✓ Shell shortcuts ✓"""
 
-    _already_present: bool = False
-
-    def compose(self) -> ComposeResult:
-        yield Static("[8 / 10]  Shell Shortcuts", classes="step_header")
-        with Container(classes="content_panel", id="shell_content"):
-            yield Static("", id="detected")
-            yield Checkbox(
-                "Add claude, claudius, codex, and codexius shortcuts to my shell profile",
-                value=True,
-                id="do_shell",
-            )
-            yield Static("", id="preview")
-        with Horizontal(classes="button_bar"):
-            yield Button("←  Back", id="back")
-            yield Button("Continue  →", variant="success", id="next")
-
-    def on_mount(self) -> None:
-        s = self.app.state
-        shell_type, shell_rc = detect_shell()
-        s.shell_type, s.shell_rc = shell_type, shell_rc
-        detected = self.query_one("#detected", Static)
-        preview = self.query_one("#preview", Static)
-        if shell_type == ShellType.UNKNOWN or not shell_rc:
-            detected.update("[yellow]⚠  Could not detect shell[/]")
-            self.query_one("#do_shell", Checkbox).value = False
-            self.query_one("#do_shell", Checkbox).disabled = True
-            preview.update("[dim]Skip this step; configure manually later.[/dim]")
-            return
-        detected.update(f"Detected: [bold]{shell_type.value}[/]  →  [dim]{shell_rc}[/]")
-        self._already_present = shell_function_is_present(shell_type, shell_rc)
-        if self._already_present:
-            preview.update("[green]✔  Already configured — nothing to add[/]")
-            self.query_one("#do_shell", Checkbox).value = False
-            self.query_one("#do_shell", Checkbox).disabled = True
-        else:
-            preview.update(f"[dim]Adds claude() and codex() functions to {shell_rc}[/dim]")
-
-    @on(Button.Pressed)
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "next":
-            do_it = self.query_one("#do_shell", Checkbox).value
-            if do_it and not self._already_present:
-                append_shell_function(
-                    self.app.state.shell_type,
-                    self.app.state.shell_rc,
-                    self.app.state.port,
-                    get_repo_root(),
-                )
-            if self.app.state.client == ClientChoice.CODEX:
-                self.app.push_screen(CodexConfigScreen())
-            else:
-                self.app.push_screen(StatuslineScreen())
-        elif event.button.id == "back":
-            self.app.pop_screen()
-
-
-# ─── 10. Codex Config (Codex-only) ─────────────────────────────
-
-class CodexConfigScreen(Screen):
-
-    def compose(self) -> ComposeResult:
-        yield Static("[9 / 10]  Codex CLI Configuration", classes="step_header")
-        with Container(classes="content_panel", id="codex_content"):
-            yield Static(
-                "The Codex CLI configuration file will be updated with proxy routing.",
-                classes="hint_label",
-            )
-            yield Static("", id="codex_config_path")
-            yield Static("", id="codex_preview")
-            yield Static("", id="codex_status")
-            yield Checkbox(
-                "Write proxy settings to Codex config (~/.codex/config.toml or .json)",
-                value=True,
-                id="do_codex_config",
-            )
-        with Horizontal(classes="button_bar"):
-            yield Button("←  Back", id="back")
-            yield Button("Continue  →", variant="success", id="next")
-
-    def on_mount(self) -> None:
-        s = self.app.state
-        path_label = self.query_one("#codex_config_path", Static)
-        preview = self.query_one("#codex_preview", Static)
-
-        codex_path = get_codex_config_path()
-        if codex_path and codex_path.exists():
-            path_label.update(f"Found: [dim]{codex_path}[/]")
-            model = s.big_model
-            if model:
-                provider_model = f"nebius/{model}" if not model.startswith("nebius/") else model
-                preview.update(
-                    f"Will set:\n"
-                    f'  model = "{provider_model}"\n'
-                    f'  base_url = "http://127.0.0.1:{s.port}/v1"\n'
-                    f'  env_key = "OPENAI_API_KEY"'
-                )
-        else:
-            path_label.update("[dim]No existing Codex config — will create ~/.codex/config.toml[/]")
-
-    @on(Button.Pressed)
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "next":
-            do_it = self.query_one("#do_codex_config", Checkbox).value
-            status = self.query_one("#codex_status", Static)
-            if do_it:
-                result = write_codex_config(
-                    self.app.state.big_model,
-                    self.app.state.port,
-                    get_repo_root(),
-                )
-                if result.get("action") == "written":
-                    status.update(f"[green]✔  {result.get('message', 'Done')}[/]")
-                else:
-                    status.update(f"[red]✘  {result.get('message', 'Unknown error')}[/]")
-            else:
-                status.update("[dim]Skipped Codex config — configure manually later.[/]")
-            self.app.push_screen(DoneScreen())
-        elif event.button.id == "back":
-            self.app.pop_screen()
-
-
-# ─── 10. Statusline Config (Claude-only) ─────────────────────
-
-class StatuslineScreen(Screen):
-
-    _needs_confirm: bool = False
     STATUSLINE_CMD = (
         '[ -z "$ANTHROPIC_BASE_URL" ] && exit 0; '
         'base="${ANTHROPIC_BASE_URL%/}"; '
@@ -840,116 +709,273 @@ class StatuslineScreen(Screen):
     )
 
     def compose(self) -> ComposeResult:
-        yield Static("[9 / 10]  Claude Code Statusline", classes="step_header")
-        with Container(classes="content_panel", id="sl_content"):
+        yield Static("[8 / 8]  Configure Your Setup", classes="step_header")
+        with Container(classes="content_panel", id="config_content"):
             yield Static(
-                "The statusline shows your proxy context usage\n"
-                "(remaining tokens %, current model) inside Claude Code's status bar.",
-            )
-            yield Static(
-                "[dim]Preview:  nebius://moonshotai/Kimi-K2.6 85% free[/]",
+                "Choose what to configure.  All options checked by default.",
                 classes="hint_label",
             )
+            yield Static("", id="config_status")
+
+            # ── Claude ──
+            yield Static("[bold rgb(0,188,212)]▐▛▜▌ Claude Code[/]", classes="section_header")
             yield Checkbox(
-                "Configure statusline in ~/.claude/settings.json",
+                "Configure Claude Code statusline (shows model + token usage in status bar)",
                 value=True,
-                id="do_statusline",
+                id="do_claude",
             )
-            yield Static("", id="status")
+            yield Static("  [dim]Writes ~/.claude/settings.json[/]", classes="hint_label", id="claude_hint")
+
+            # ── Codex ──
+            yield Static("[bold rgb(0,188,212)]▐▛▜▌ Codex CLI[/]", classes="section_header")
+            yield Checkbox(
+                "Configure Codex CLI proxy routing (~/.codex/config.toml)",
+                value=True,
+                id="do_codex",
+            )
+            yield Static("", classes="hint_label", id="codex_hint")
+
+            # ── Shell Shortcuts / Profiles ──
+            yield Static("[bold rgb(0,188,212)]▐▛▜▌ Shell Shortcuts[/]", classes="section_header")
+            yield Static("Select profiles to add shortcuts:", classes="hint_label", id="profile_label")
+            yield Static("", id="profile_status")
+
         with Horizontal(classes="button_bar"):
             yield Button("←  Back", id="back")
-            yield Button("Continue  →", variant="success", id="next")
+            yield Button("Apply & Finish  →", variant="success", id="next")
 
     def on_mount(self) -> None:
+        s = self.app.state
+
+        # ── Claude hint ──
+        claude_hint = self.query_one("#claude_hint", Static)
         settings_path = get_claude_settings_path()
-        status = self.query_one("#status", Static)
         if settings_path.exists():
             try:
                 existing = json.loads(settings_path.read_text(encoding="utf-8"))
                 if "statusLine" in existing:
-                    status.update("[yellow]⚠  A statusLine config already exists.[/]")
+                    self.app.state.statusline_exists = True
+                    claude_hint.update(f"  [dim]Note: ~/.claude/settings.json exists[/] — will prompt if different")
             except Exception:
                 pass
+
+        # ── Codex hint ──
+        codex_hint = self.query_one("#codex_hint", Static)
+        codex_path = get_codex_config_path()
+        if codex_path and codex_path.exists():
+            model = s.big_model
+            if model:
+                provider_model = f"nebius/{model}" if not model.startswith("nebius/") else model
+                codex_hint.update(
+                    f"  [dim]Found existing config — will update model={provider_model}[/]"
+                )
+        else:
+            codex_hint.update("  [dim]No existing config — will create ~/.codex/config.toml[/]")
+
+        # ── Shell profiles ──
+        from .utils import get_all_shell_profiles
+
+        profile_container = self.query_one("#config_content", Container)
+        profile_label = self.query_one("#profile_label", Static)
+        profile_status = self.query_one("#profile_status", Static)
+
+        s.available_profiles = get_all_shell_profiles()
+
+        if not s.available_profiles:
+            profile_label.update("[yellow]⚠ No shell profiles detected — install bash, zsh, or PowerShell[/]")
+            profile_status.update("[dim]Skipping profile configuration.[/dim]")
+        else:
+            # Clear the old hint and add checkboxes for each profile
+            profile_label.update("Select profiles to add shortcuts:")
+            selected: list[tuple[ShellType, str]] = []
+
+            for idx, (stype, path) in enumerate(s.available_profiles):
+                # Check if functions already exist in this profile
+                already_has = shell_function_is_present(stype, path)
+                checkbox_id = f"profile_{idx}"
+
+                if already_has:
+                    # Show as already configured, unchecked and disabled
+                    profile_container.mount(Checkbox(
+                        f"[dim]{path} (already configured)[/dim]",
+                        value=False,
+                        disabled=True,
+                        id=checkbox_id,
+                    ))
+                else:
+                    # Checked by default, user can uncheck
+                    selected.append((stype, path))
+                    profile_container.mount(Checkbox(
+                        path,
+                        value=True,
+                        id=checkbox_id,
+                    ))
+
+            s.selected_profiles = selected
+            profile_status.update(f"[dim]Will add to {len(selected)} profile(s)[/dim]")
+
+    @on(Checkbox.Changed)
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        """Update state when checkboxes toggle."""
+        cb = event.checkbox
+        if cb.id == "do_claude":
+            self.app.state.configure_claude = cb.value
+        elif cb.id == "do_codex":
+            self.app.state.configure_codex = cb.value
+        elif cb.id and cb.id.startswith("profile_"):
+            # Recompute selected profiles from all profile_* checkboxes
+            s = self.app.state
+            selected: list[tuple[ShellType, str]] = []
+            for idx, (stype, path) in enumerate(s.available_profiles):
+                try:
+                    cb_widget = self.query_one(f"#profile_{idx}", Checkbox)
+                    if cb_widget and cb_widget.value:
+                        selected.append((stype, path))
+                except Exception:
+                    continue
+            s.selected_profiles = selected
+            profile_status = self.query_one("#profile_status", Static)
+            count = len(selected)
+            total = len(s.available_profiles)
+            if count == 0:
+                profile_status.update("[dim]No profiles selected[/dim]")
+            else:
+                profile_status.update(f"[dim]Will add to {count}/{total} profile(s)[/dim]")
+
+    def _write_codex(self) -> str:
+        result = write_codex_config(
+            self.app.state.big_model,
+            self.app.state.port,
+            get_repo_root(),
+        )
+        if result.get("action") == "written":
+            return f"[green]✔  {result.get('message', 'Done')}[/]"
+        else:
+            return f"[red]✘  {result.get('message', 'Unknown error')}[/]"
+
+    def _write_statusline(self) -> tuple[str, bool]:
+        """Return (msg, blocked_on_modal)."""
+        settings_path = get_claude_settings_path()
+        if settings_path.exists():
+            try:
+                existing = json.loads(settings_path.read_text(encoding="utf-8"))
+                sl = existing.get("statusLine")
+                if isinstance(sl, dict) and sl.get("command", "").strip() == self.STATUSLINE_CMD.strip():
+                    return ("[green]✔  statusLine already configured correctly[/]", False)
+                if "statusLine" in existing:
+                    def handle(overwrite: bool) -> None:
+                        status = self.query_one("#config_status", Static)
+                        if overwrite:
+                            result = safe_merge_settings(self.STATUSLINE_CMD, get_repo_root())
+                            status.update(f"[green]✔  {result.get('message', '')}[/]")
+                            self.app.state.configure_statusline = True
+                        else:
+                            status.update("[dim]Kept existing statusLine — skipped.[/]")
+                            self.app.state.configure_statusline = False
+                        self._finish()
+                    self.app.push_screen(OverwriteStatuslineModal(), callback=handle)
+                    return ("", True)
+            except Exception:
+                pass
+        result = safe_merge_settings(self.STATUSLINE_CMD, get_repo_root())
+        action = result.get("action", "")
+        if action in ("created", "added"):
+            return (f"[green]✔  {result.get('message', '')}[/]", False)
+        elif action == "exists":
+            return (f"[green]✔  {result.get('message', '')}[/]", False)
+        return (f"[dim]{result.get('message', '')}[/]", False)
+
+    def _finish(self) -> None:
+        self.app.push_screen(DoneScreen())
 
     @on(Button.Pressed)
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "next":
-            do_it = self.query_one("#do_statusline", Checkbox).value
-            status = self.query_one("#status", Static)
-            settings_path = get_claude_settings_path()
+            s = self.app.state
+            status = self.query_one("#config_status", Static)
+            lines: list[str] = []
 
-            if not do_it:
-                self.app.push_screen(DoneScreen())
-                return
+            # ── Shell profiles ──
+            for stype, path in s.selected_profiles:
+                append_shell_function(stype, path, s.port, get_repo_root())
+                lines.append(f"[green]✔  Added to {path}[/green]")
+            skipped = sum(1 for _, path in s.available_profiles
+                         if shell_function_is_present(ShellType.UNKNOWN, path)) if s.available_profiles else 0
+            if skipped > 0:
+                lines.append(f"[dim]  Skipped {skipped} already-configured profile(s)[/dim]")
+            if not s.selected_profiles and not skipped:
+                lines.append("[dim]  No shell profiles selected[/dim]")
 
-            # Check if existing statusline differs
-            if settings_path.exists():
-                try:
-                    existing = json.loads(settings_path.read_text(encoding="utf-8"))
-                    sl = existing.get("statusLine")
-                    if isinstance(sl, dict) and sl.get("command", "").strip() == self.STATUSLINE_CMD.strip():
-                        status.update("[green]✔  statusLine already configured identically — skipping[/]")
-                        self.app.push_screen(DoneScreen())
-                        return
-                    if "statusLine" in existing:
-                        def handle(overwrite: bool) -> None:
-                            if overwrite:
-                                result = safe_merge_settings(self.STATUSLINE_CMD, get_repo_root())
-                                status.update(f"[green]✔  {result.get('message', '')}[/]")
-                            else:
-                                status.update("[dim]Kept existing statusLine — skipped.[/]")
-                            self.app.push_screen(DoneScreen())
-                        self.app.push_screen(OverwriteStatuslineModal(), callback=handle)
-                        return
-                except Exception:
-                    pass
+            # ── Codex ──
+            if s.configure_codex:
+                lines.append(self._write_codex())
 
-            result = safe_merge_settings(self.STATUSLINE_CMD, get_repo_root())
-            action = result.get("action", "")
-            if action in ("created", "added"):
-                status.update(f"[green]✔  {result.get('message', '')}[/]")
-            elif action == "exists":
-                status.update(f"[green]✔  {result.get('message', '')}[/]")
-            self.app.push_screen(DoneScreen())
+            # ── Claude / statusline ──
+            if s.configure_claude:
+                msg, blocked = self._write_statusline()
+                if blocked:
+                    # Modal will call _finish() when done
+                    return
+                if msg:
+                    lines.append(msg)
+
+            if lines:
+                status.update("\n".join(lines))
+                self.set_timer(0.5, self._finish)
+            else:
+                self._finish()
+
         elif event.button.id == "back":
             self.app.pop_screen()
 
 
-# ─── 11. Done ──────────────────────────────────────────────────
+# ─── 9. Done ──────────────────────────────────────────────────
 
 class DoneScreen(Screen):
 
     def compose(self) -> ComposeResult:
-        yield Static("[10 / 10]  Done!", classes="step_header")
+        yield Static("[8 / 8]  Done!", classes="step_header")
         with Container(classes="content_panel", id="done_content"):
             yield Static("Your proxy is ready!", classes="success_label")
             s = self.app.state
-            if s.client == ClientChoice.CODEX:
-                yield Markdown(f"""**Start the proxy:**
-                    ```
-                    .venv/bin/python start_proxy.py
-                    ```
-                    **Use it:**
-                    ```
-                    codex --proxy
-                    ```
-                    *(or open the Codex Desktop app — it'll use the proxy automatically)*
+            lines: list[str] = []
+            lines.append("**Start the proxy:**")
+            lines.append("```")
+            lines.append(".venv/bin/python start_proxy.py")
+            lines.append("```")
+            lines.append("")
 
-                    **Dashboard:**  http://localhost:{s.port}/dashboard
+            if s.configure_claude:
+                lines.append("**Use Claude Code (via proxy):**")
+                lines.append("```")
+                lines.append("claude --proxy")
+                lines.append("# or: claudius")
+                lines.append("```")
+                lines.append("")
+            if s.configure_codex:
+                lines.append("**Use Codex CLI (via proxy):**")
+                lines.append("```")
+                lines.append("codex --proxy")
+                lines.append("# or: codexius")
+                lines.append("```")
+                lines.append("*(Codex Desktop app will use proxy automatically)*")
+                lines.append("")
+            if s.selected_profiles:
+                profiles_str = ", ".join(f"`{path}`" for _, path in s.selected_profiles)
+                lines.append(f"**Restart shells** to activate shortcuts: {profiles_str}")
+                lines.append("")
+            lines.append("**Alternative: Docker** (if available)")
+            lines.append("```")
+            lines.append("docker compose up --build -d")
+            lines.append("# stop: docker compose down")
+            lines.append("```")
+            lines.append("")
 
-[dim]Hit Finish to close this wizard.[/dim]""")
-            else:
-                yield Markdown(f"""**Start the proxy:**
-                    ```
-                    .venv/bin/python start_proxy.py
-                    ```
-                    **Use it:**
-                    ```
-                    claude --proxy
-                    ```
-                    **Dashboard:**  http://localhost:{s.port}/dashboard
+            lines.append(f"**Dashboard:**  http://localhost:{s.port}/dashboard")
+            lines.append("")
+            lines.append("[dim]Hit Finish to close this wizard.[/dim]")
 
-[dim]Hit Finish to close this wizard.[/dim]""")
+            yield Markdown("\n".join(lines))
         with Horizontal(classes="button_bar"):
             yield Button("Finish", variant="success", id="finish")
 

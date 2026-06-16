@@ -25,7 +25,13 @@ class ClientChoice(Enum):
 
 @dataclass
 class InstallState:
-    client: ClientChoice = ClientChoice.CLAUDE
+    client: ClientChoice = ClientChoice.CLAUDE  # Kept for backward compat; prefer configure_claude + configure_codex
+    configure_claude: bool = True
+    configure_codex: bool = True
+    configure_shell: bool = True
+    configure_statusline: bool = True
+    configure_codex_config: bool = True
+    configure_profiles: bool = True
     python_version: str = ""
     has_pip: bool = False
     has_curl: bool = False
@@ -38,9 +44,10 @@ class InstallState:
     vision_model: str = ""
     shell_type: ShellType = ShellType.UNKNOWN
     shell_rc: str = ""
-    configure_shell: bool = True
-    configure_statusline: bool = True
+    available_profiles: list[tuple[ShellType, str]] = field(default_factory=list)  # All detected profiles
+    selected_profiles: list[tuple[ShellType, str]] = field(default_factory=list)  # User-selected to write to
     statusline_exists: bool = False
+    shell_functions_exist: bool = False
     venv_exists: bool = False
     deps_installed: bool = False
     models_fetched: bool = False
@@ -116,6 +123,34 @@ def detect_shell() -> tuple[ShellType, str]:
         return ShellType.PWSH, pwsh_profile
 
     return ShellType.UNKNOWN, ""
+
+
+def get_all_shell_profiles() -> list[tuple[ShellType, str]]:
+    """Detect all shell profiles available on the system.
+
+    Returns list of (ShellType, path) tuples for each profile that exists.
+    """
+    profiles: list[tuple[ShellType, str]] = []
+
+    # Check each profile type
+    bashrc = os.path.expanduser("~/.bashrc")
+    if os.path.isfile(bashrc):
+        profiles.append((ShellType.BASH, bashrc))
+
+    zshrc = os.path.expanduser("~/.zshrc")
+    if os.path.isfile(zshrc):
+        profiles.append((ShellType.ZSH, zshrc))
+
+    pwsh_profile = _get_pwsh_profile()
+    if pwsh_profile and os.path.isfile(pwsh_profile):
+        profiles.append((ShellType.PWSH, pwsh_profile))
+
+    # Check for Warp shell profile (warp is a GPU-accelerated terminal)
+    warp_init = os.path.expanduser("~/.warp_initialization")
+    if os.path.isfile(warp_init):
+        profiles.append((ShellType.UNKNOWN, warp_init))
+
+    return profiles
 
 
 def get_claude_settings_path() -> pathlib.Path:

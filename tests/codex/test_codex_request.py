@@ -501,20 +501,40 @@ def test_reasoning_absent_no_reasoning_effort():
 # ---------------------------------------------------------------------------
 # Tool choice passthrough
 # ---------------------------------------------------------------------------
-def test_tool_choice_passthrough():
-    """(12) Simple string tool_choice values are passed through."""
+def test_tool_choice_passthrough_with_tools():
+    """(12) Tool_choice is passed through when tools are also present."""
+    tools = [{"type": "function", "function": {"name": "foo", "parameters": {}}}]
     for choice in ("auto", "required", "none"):
-        request = _make_request(tool_choice=choice)
+        request = _make_request(tool_choice=choice, tools=tools)
         result = convert_responses_to_openai_chat(request)
         assert result["tool_choice"] == choice
+        assert result["tools"] == tools
 
     # Object form passthrough when no tool_ctx is present
-    request = _make_request(tool_choice={"type": "function", "function": {"name": "foo"}})
+    request = _make_request(
+        tool_choice={"type": "function", "function": {"name": "foo"}},
+        tools=tools,
+    )
     result = convert_responses_to_openai_chat(request)
     assert result["tool_choice"] == {
         "type": "function",
         "function": {"name": "foo"},
     }
+    assert result["tools"] == tools
+
+
+def test_tool_choice_dropped_without_tools():
+    """(12b) Tool_choice without tools is dropped to avoid 400 from backends that
+    require tools when tool_choice is set."""
+    request = _make_request(tool_choice="auto")
+    result = convert_responses_to_openai_chat(request)
+    assert "tool_choice" not in result
+    assert "tools" not in result
+
+    request = _make_request(tool_choice={"type": "function", "function": {"name": "foo"}})
+    result = convert_responses_to_openai_chat(request)
+    assert "tool_choice" not in result
+    assert "tools" not in result
 
 
 # ---------------------------------------------------------------------------

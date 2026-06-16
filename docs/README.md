@@ -1,6 +1,6 @@
 # Documentation Index
 
-Full reference for `claude-code-proxy`. For the quick-start guide, see the root [README.md](../README.md).
+Full reference for `claude-codex-nebius-proxy`. For the quick-start guide, see the root [README.md](../README.md).
 
 ---
 
@@ -180,13 +180,13 @@ uv run mypy src
 
 ## Reference docs
 
-| Doc | Topic |
-|-----|-------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | System flow, request conversion, file map |
-| [TOOL_CALL_FORMAT.md](TOOL_CALL_FORMAT.md) | Claude SSE tool-call streaming |
-| [OBSERVABILITY.md](OBSERVABILITY.md) | Dashboard config, persistence |
-| [SHELL_FUNCTION.md](SHELL_FUNCTION.md) | Shell shortcut reference |
-| [BINARY_PACKAGING.md](BINARY_PACKAGING.md) | Standalone binary notes |
+| Doc                                        | Topic                                     |
+| ------------------------------------------ | ----------------------------------------- |
+| [ARCHITECTURE.md](ARCHITECTURE.md)         | System flow, request conversion, file map |
+| [TOOL_CALL_FORMAT.md](TOOL_CALL_FORMAT.md) | Claude SSE tool-call streaming            |
+| [OBSERVABILITY.md](OBSERVABILITY.md)       | Dashboard config, persistence             |
+| [SHELL_FUNCTION.md](SHELL_FUNCTION.md)     | Shell shortcut reference                  |
+| [BINARY_PACKAGING.md](BINARY_PACKAGING.md) | Standalone binary notes                   |
 
 ## License
 

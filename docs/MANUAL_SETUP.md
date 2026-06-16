@@ -8,7 +8,7 @@ Bypass the TUI and set everything up by hand.
 
 ```bash
 git clone <repo-url>
-cd claude-code-proxy
+cd claude-codex-nebius-proxy
 ```
 
 ---
@@ -54,20 +54,20 @@ cp .env.example .env
 
 Edit the file. The values you **must** change are marked below.
 
-| Variable | Required? | Description |
-|----------|-----------|-------------|
-| `OPENAI_API_KEY` | **Yes** | Your Nebius API key from [nebius.com](https://nebius.com) |
-| `ANTHROPIC_API_KEY` | No | Keep as `claude-local` (proxy uses bearer auth) |
-| `OPENAI_BASE_URL` | No | Defaults to `https://api.tokenfactory.nebius.com/v1` |
-| `BIG_MODEL` | No | Defaults to `moonshotai/Kimi-K2.6` |
-| `MIDDLE_MODEL` | No | Defaults to `moonshotai/Kimi-K2.6` |
-| `SMALL_MODEL` | No | Defaults to `moonshotai/Kimi-K2.6` |
-| `VISION_MODEL` | No | Defaults to `moonshotai/Kimi-K2.6` |
-| `HOST` | No | Defaults to `0.0.0.0` |
-| `PORT` | No | Defaults to `8083` |
-| `LOG_LEVEL` | No | `INFO` or `DEBUG` |
-| `MAX_TOKENS_LIMIT` | No | Defaults to `16384` |
-| `STATUSLINE_PERCENT_ADJUST` | No | Offset the free-% shown in the statusline (e.g. `-10` means 80% shows as 90% free). Range `-100` to `+100` |
+| Variable                    | Required? | Description                                                                                                |
+| --------------------------- | --------- | ---------------------------------------------------------------------------------------------------------- |
+| `OPENAI_API_KEY`            | **Yes**   | Your Nebius API key from [nebius.com](https://nebius.com)                                                  |
+| `ANTHROPIC_API_KEY`         | No        | Keep as `claude-local` (proxy uses bearer auth)                                                            |
+| `OPENAI_BASE_URL`           | No        | Defaults to `https://api.tokenfactory.nebius.com/v1`                                                       |
+| `BIG_MODEL`                 | No        | Defaults to `moonshotai/Kimi-K2.6`                                                                         |
+| `MIDDLE_MODEL`              | No        | Defaults to `moonshotai/Kimi-K2.6`                                                                         |
+| `SMALL_MODEL`               | No        | Defaults to `moonshotai/Kimi-K2.6`                                                                         |
+| `VISION_MODEL`              | No        | Defaults to `moonshotai/Kimi-K2.6`                                                                         |
+| `HOST`                      | No        | Defaults to `0.0.0.0`                                                                                      |
+| `PORT`                      | No        | Defaults to `8083`                                                                                         |
+| `LOG_LEVEL`                 | No        | `INFO` or `DEBUG`                                                                                          |
+| `MAX_TOKENS_LIMIT`          | No        | Defaults to `16384`                                                                                        |
+| `STATUSLINE_PERCENT_ADJUST` | No        | Offset the free-% shown in the statusline (e.g. `-10` means 80% shows as 90% free). Range `-100` to `+100` |
 
 > Verify model IDs against the live endpoint before committing: `GET https://api.tokenfactory.nebius.com/v1/models`
 
@@ -75,11 +75,11 @@ Edit the file. The values you **must** change are marked below.
 
 ## 4. Start the Proxy
 
-| Method | Command |
-|--------|---------|
-| Standard venv | `.venv/bin/python start_proxy.py` |
-| uv | `.venv/bin/python start_proxy.py` (or `uv run python start_proxy.py` if you prefer) |
-| Docker | `docker compose up -d` (already running from §2c) |
+| Method        | Command                                                                             |
+| ------------- | ----------------------------------------------------------------------------------- |
+| Standard venv | `.venv/bin/python start_proxy.py`                                                   |
+| uv            | `.venv/bin/python start_proxy.py` (or `uv run python start_proxy.py` if you prefer) |
+| Docker        | `docker compose up -d` (already running from §2c)                                   |
 
 The dashboard opens at `http://localhost:8083/dashboard`.
 
@@ -230,11 +230,11 @@ alias claudius='claude --proxy'
 
 ## Summary of Commands
 
-| Task | Command |
-|------|---------|
-| Start proxy (venv/uv) | `.venv/bin/python start_proxy.py` |
-| Start proxy (Docker) | `docker compose up -d` |
-| Open dashboard | `http://localhost:8083/dashboard` |
-| Run Claude via proxy | `claude --proxy` (if you added the function) |
-| Quick env vars | `export ANTHROPIC_AUTH_TOKEN=claude-local; export ANTHROPIC_BASE_URL=http://localhost:8083` |
+| Task                  | Command                                                                                     |
+| --------------------- | ------------------------------------------------------------------------------------------- |
+| Start proxy (venv/uv) | `.venv/bin/python start_proxy.py`                                                           |
+| Start proxy (Docker)  | `docker compose up -d`                                                                      |
+| Open dashboard        | `http://localhost:8083/dashboard`                                                           |
+| Run Claude via proxy  | `claude --proxy` (if you added the function)                                                |
+| Quick env vars        | `export ANTHROPIC_AUTH_TOKEN=claude-local; export ANTHROPIC_BASE_URL=http://localhost:8083` |
 

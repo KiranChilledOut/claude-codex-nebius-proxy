@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "claude-code-proxy-nebius"
+name = "claude-codex-nebius-proxy-nebius"
 version = "1.0.0"
 description = "Specialized proxy server enabling Claude Code to work with Nebius token factory API"
 readme = "README.md"
@@ -45,12 +45,12 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/KiranChilledOut/claude-code-proxy"
-Repository = "https://github.com/KiranChilledOut/claude-code-proxy.git"
-Issues = "https://github.com/KiranChilledOut/claude-code-proxy/issues"
+Homepage = "https://github.com/KiranChilledOut/claude-codex-nebius-proxy"
+Repository = "https://github.com/KiranChilledOut/claude-codex-nebius-proxy.git"
+Issues = "https://github.com/KiranChilledOut/claude-codex-nebius-proxy/issues"
 
 [project.scripts]
-claude-code-proxy-nebius = "src.main:main"
+claude-codex-nebius-proxy-nebius = "src.main:main"
 
 [dependency-groups]
 dev = [
