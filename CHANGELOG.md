@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Ensemble Leaderboard** on the dashboard global view — per-model win/loss aggregates across all ensemble races in the selected window: races, wins, win %, **user picks** (human-chosen winners, the trust signal), timeout wins, average score, average latency, and errors. Backed by a new `fetch_ensemble_leaderboard` aggregate query and the `/api/observability/ensemble/leaderboard` endpoint.
 - Multi-theme selector (5 themes): **Lime** (default, cyberpunk), **Navy & White** (corporate), **Mono** (high-contrast), **Star Wars** (Imperial/Sith), **KTM** (orange/black). Replaced binary light/dark toggle in `dashboard.css`, `dashboard.js`, `dashboard.html`.
 - `/dashboard/health` endpoint — lightweight availability check returning `{"status": "ok", "version": "1.0"}`, useful for load balancers and uptime monitors.
 - `Cache-Control: public, max-age=3600, must-revalidate` headers on dashboard static assets (`/dashboard/assets/*`).

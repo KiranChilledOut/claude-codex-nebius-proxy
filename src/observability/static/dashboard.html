@@ -219,6 +219,42 @@
             </div>
           </section>
 
+          <section class="panel table-panel is-collapsed" data-collapsible="ensembleLeaderboard">
+            <div class="panel-head">
+              <button
+                class="collapse-toggle"
+                type="button"
+                aria-expanded="false"
+                aria-controls="ensembleLeaderboardPanel"
+                data-target="ensembleLeaderboardPanel"
+              >
+                <span class="collapse-title">Ensemble Leaderboard</span>
+                <span id="ensembleLeaderboardCount" class="panel-count">0 rows</span>
+                <span class="chevron" aria-hidden="true">&#9656;</span>
+              </button>
+            </div>
+            <div id="ensembleLeaderboardPanel" class="collapsible-content">
+              <div class="table-wrap">
+                <table data-table="ensembleLeaderboard">
+                  <thead>
+                    <tr>
+                      <th>Model</th>
+                      <th>Races</th>
+                      <th>Wins</th>
+                      <th>Win %</th>
+                      <th>User Picks</th>
+                      <th>Timeouts</th>
+                      <th>Avg Score</th>
+                      <th>Avg Latency</th>
+                      <th>Errors</th>
+                    </tr>
+                  </thead>
+                  <tbody id="ensembleLeaderboardBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
           <section class="panel table-panel is-collapsed" data-collapsible="requests">
             <div class="panel-head">
               <button

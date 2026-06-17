@@ -256,6 +256,45 @@ class ObservabilityRecorder:
             run["candidates"].sort(key=lambda c: c["candidate_index"])
         return [runs[rid] for rid in order]
 
+    def fetch_ensemble_leaderboard(self, *, hours: int = 24) -> List[Dict[str, Any]]:
+        """Per-model win/loss aggregates across all ensemble races in the window.
+
+        One row per model: how often it raced, how often it won, how often a
+        human picked it (chosen_by='user' — the trust signal), plus average
+        score and latency. Win rate is wins / races (races it errored out of
+        still count against it, since it failed to produce a usable answer)."""
+        if not self.enabled or not Path(self.db_path).exists():
+            return []
+        cutoff_iso = datetime.fromtimestamp(
+            time.time() - (hours * 3600), timezone.utc
+        ).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    model,
+                    COUNT(*) AS races,
+                    COALESCE(SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END), 0) AS wins,
+                    COALESCE(SUM(CASE WHEN status = 'won' AND chosen_by = 'user' THEN 1 ELSE 0 END), 0) AS user_picks,
+                    COALESCE(SUM(CASE WHEN status = 'won' AND chosen_by = 'timeout' THEN 1 ELSE 0 END), 0) AS timeout_wins,
+                    COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS errors,
+                    AVG(CASE WHEN score IS NOT NULL THEN score END) AS avg_score,
+                    AVG(CASE WHEN status != 'error' THEN latency_ms END) AS avg_latency_ms
+                FROM ensemble_candidates
+                WHERE created_at >= ?
+                GROUP BY model
+                ORDER BY wins DESC, races DESC
+                """,
+                (cutoff_iso,),
+            ).fetchall()
+        leaderboard = []
+        for row in rows:
+            data = dict(row)
+            races = data["races"] or 0
+            data["win_rate"] = (data["wins"] / races) if races else 0.0
+            leaderboard.append(data)
+        return leaderboard
+
     def fetch_summary(self, *, hours: int = 24) -> Dict[str, Any]:
         if not self.enabled or not Path(self.db_path).exists():
             return self._empty_summary(hours)
