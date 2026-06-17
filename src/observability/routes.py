@@ -262,6 +262,20 @@ async def ensemble_runs(
     }
 
 
+@router.get("/api/observability/ensemble/leaderboard")
+async def ensemble_leaderboard(
+    hours: int = Query(24, ge=1, le=8760),
+    _: None = Depends(validate_dashboard_api_key),
+):
+    """Per-model win/loss aggregates across all ensemble races in the window."""
+    return {
+        "mode": config.ensemble_mode,
+        "models": config.ensemble_models,
+        "hours": hours,
+        "leaderboard": observability_recorder.fetch_ensemble_leaderboard(hours=hours),
+    }
+
+
 @router.get("/api/observability/ensemble/pending")
 async def ensemble_pending(_: None = Depends(validate_dashboard_api_key)):
     """Races currently held open waiting for the user's choice (approval mode)."""

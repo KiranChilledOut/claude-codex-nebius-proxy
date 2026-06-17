@@ -104,6 +104,67 @@ async def test_observability_recorder_persists_request_and_tool_call(tmp_path):
     assert "[redacted]" in tool_calls[0]["arguments_preview"]
 
 
+@pytest.mark.asyncio
+async def test_fetch_ensemble_leaderboard_aggregates_wins_and_user_picks(tmp_path):
+    from src.ensemble.engine import EnsembleCandidate
+
+    db_path = tmp_path / "observability.sqlite3"
+    recorder = ObservabilityRecorder(
+        enabled=True,
+        db_path=str(db_path),
+        queue_size=50,
+        pricing_catalog=PricingCatalog("{}"),
+        store_tool_args=True,
+    )
+    await recorder.start()
+
+    def cand(index, model, status, chosen_by, score, latency):
+        c = EnsembleCandidate(index=index, model=model)
+        c.status = status
+        c.chosen_by = chosen_by
+        c.score = score
+        c.latency_ms = latency
+        return c
+
+    # Race 1: model-a wins automatically over model-b.
+    recorder.record_ensemble(
+        request_id="r1",
+        session_id="s1",
+        session_name="sess",
+        mode="hedge",
+        candidates=[
+            cand(0, "model-a", "won", "auto", 4.0, 800),
+            cand(1, "model-b", "lost", None, 2.0, 600),
+        ],
+    )
+    # Race 2: the user overrides and picks model-b; model-a errored out.
+    recorder.record_ensemble(
+        request_id="r2",
+        session_id="s1",
+        session_name="sess",
+        mode="approval",
+        candidates=[
+            cand(0, "model-a", "error", None, float("-inf"), 1200),
+            cand(1, "model-b", "won", "user", 3.0, 700),
+        ],
+    )
+    await recorder.stop()
+
+    board = {row["model"]: row for row in recorder.fetch_ensemble_leaderboard(hours=24)}
+
+    assert board["model-a"]["races"] == 2
+    assert board["model-a"]["wins"] == 1
+    assert board["model-a"]["errors"] == 1
+    assert board["model-a"]["win_rate"] == pytest.approx(0.5)
+    # Errored race excluded from avg latency (only the 800ms win counts).
+    assert board["model-a"]["avg_latency_ms"] == pytest.approx(800)
+
+    assert board["model-b"]["races"] == 2
+    assert board["model-b"]["wins"] == 1
+    assert board["model-b"]["user_picks"] == 1
+    assert board["model-b"]["errors"] == 0
+
+
 def test_connect_closes_connection_even_on_exception(monkeypatch):
     """_connect context manager calls conn.close() in finally when an exception is raised."""
     recorder = ObservabilityRecorder(

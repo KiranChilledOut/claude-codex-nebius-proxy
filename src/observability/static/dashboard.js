@@ -651,6 +651,76 @@ const tableConfigs = {
       },
     ],
   },
+  ensembleLeaderboard: {
+    bodyId: "ensembleLeaderboardBody",
+    countId: "ensembleLeaderboardCount",
+    empty: "No ensemble races yet",
+    columns: [
+      {
+        id: "model",
+        label: "Model",
+        type: "text",
+        value: (row) => row.model || "unknown",
+        render: (row) => `<code>${escapeHtml(row.model || "unknown")}</code>`,
+      },
+      {
+        id: "races",
+        label: "Races",
+        type: "number",
+        value: (row) => Number(row.races || 0),
+        render: (row) => fmtInt(row.races),
+      },
+      {
+        id: "wins",
+        label: "Wins",
+        type: "number",
+        value: (row) => Number(row.wins || 0),
+        render: (row) => fmtInt(row.wins),
+      },
+      {
+        id: "win_rate",
+        label: "Win %",
+        type: "number",
+        value: (row) => Number(row.win_rate || 0),
+        render: (row) => `${Math.round((row.win_rate || 0) * 100)}%`,
+      },
+      {
+        id: "user_picks",
+        label: "User Picks",
+        type: "number",
+        value: (row) => Number(row.user_picks || 0),
+        render: (row) => fmtInt(row.user_picks),
+      },
+      {
+        id: "timeout_wins",
+        label: "Timeouts",
+        type: "number",
+        value: (row) => Number(row.timeout_wins || 0),
+        render: (row) => fmtInt(row.timeout_wins),
+      },
+      {
+        id: "avg_score",
+        label: "Avg Score",
+        type: "number",
+        value: (row) => Number(row.avg_score || 0),
+        render: (row) => (row.avg_score == null ? "—" : Number(row.avg_score).toFixed(1)),
+      },
+      {
+        id: "avg_latency_ms",
+        label: "Avg Latency",
+        type: "number",
+        value: (row) => Number(row.avg_latency_ms || 0),
+        render: (row) => fmtMs(row.avg_latency_ms),
+      },
+      {
+        id: "errors",
+        label: "Errors",
+        type: "number",
+        value: (row) => Number(row.errors || 0),
+        render: (row) => fmtInt(row.errors),
+      },
+    ],
+  },
   requests: {
     bodyId: "requestsBody",
     countId: "requestsCount",
@@ -963,8 +1033,10 @@ class DashboardApp {
       sessionRequests: [],
       sessionFailures: [],
       sessionToolCalls: [],
+      ensembleLeaderboard: [],
       tables: {
         modelStats: { sort: { column: "request_count", direction: "desc" }, filters: {} },
+        ensembleLeaderboard: { sort: { column: "wins", direction: "desc" }, filters: {} },
         requests: { sort: { column: "started_at", direction: "desc" }, filters: {} },
         failures: { sort: { column: "started_at", direction: "desc" }, filters: {} },
         toolCalls: { sort: { column: "timestamp", direction: "desc" }, filters: {} },
@@ -1349,16 +1421,18 @@ class DashboardApp {
       do {
         this.state.refreshQueued = false;
         const hours = el("windowSelect")?.value || "24";
-        const [summary, requests, failures, toolCalls] = await Promise.all([
+        const [summary, requests, failures, toolCalls, leaderboard] = await Promise.all([
           fetchJson(`/api/observability/summary?hours=${hours}`),
           fetchJson("/api/observability/requests?limit=500"),
           fetchJson("/api/observability/failures?limit=500"),
           fetchJson("/api/observability/tool-calls?limit=500"),
+          fetchJson(`/api/observability/ensemble/leaderboard?hours=${hours}`).catch(() => ({ leaderboard: [] })),
         ]);
         this.state.summary = summary;
         this.state.requests = requests.data || [];
         this.state.failures = failures.data || [];
         this.state.toolCalls = toolCalls.data || [];
+        this.state.ensembleLeaderboard = leaderboard.leaderboard || [];
         this.render();
 
         // Announce refresh to screen readers
@@ -1388,6 +1462,7 @@ class DashboardApp {
     this.renderModels();
     this.renderCharts();
     this.renderTableById("modelStats");
+    this.renderTableById("ensembleLeaderboard");
     this.renderTableById("requests");
     this.renderTableById("failures");
     this.renderTableById("toolCalls");
@@ -1647,6 +1722,8 @@ class DashboardApp {
     switch (tableId) {
       case "modelStats":
         return this.state.summary?.model_stats || [];
+      case "ensembleLeaderboard":
+        return this.state.ensembleLeaderboard || [];
       case "requests":
         return this.state.requests || [];
       case "failures":
