@@ -147,6 +147,23 @@ For full configuration options, model details, architecture, troubleshooting, an
 
 Designed for Nebius token factory infrastructure. Defaults and troubleshooting guidance are Nebius-centric rather than provider-agnostic.
 
+## Alternatives
+
+This proxy is batteries-included and Nebius-tuned. If your needs are narrower, two well-maintained, config-driven tools cover the core Anthropic/OpenAI ↔ Nebius translation with much less to run:
+
+- **[claude-code-router](https://github.com/musistudio/claude-code-router)** — points Claude Code at any OpenAI-compatible endpoint (including Nebius Token Factory) with per-request-type model routing (`default` / `background` / `think` / `longContext`, analogous to this project's big / middle / small / vision). Install, drop Nebius into a JSON config, run `ccr code`. Best if you use **only Claude Code** and want lightweight routing that tracks upstream Claude Code updates.
+- **[LiteLLM proxy](https://docs.litellm.ai/docs/anthropic_unified/)** — exposes an Anthropic `/v1/messages` surface in front of any OpenAI-compatible backend, with built-in routing, fallbacks, and cost tracking. Point Claude Code at it via `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`. Best if you want a mature multi-provider gateway, or already run LiteLLM. (Pin to a known-good release — a couple of past versions were flagged in a supply-chain incident.)
+
+### When to use this project instead
+
+Reach for this proxy when you want the extras those tools don't bundle:
+
+- **One bridge for both CLIs** — Claude Code (`/v1/messages`) *and* OpenAI Codex (`/v1/responses`) against the same Nebius backend.
+- **Server-side web search** — runs `web_search` tool calls via Tavily and returns results to the model, so search works behind a non-Anthropic backend.
+- **Claude Code housekeeping optimizations** — answers low-value requests (title generation, network probes, filepath extraction) locally to save tokens and latency.
+- **Tool-call JSON repair, context auto-truncation, and a built-in cost/latency dashboard.**
+- **Nebius-first ergonomics** — TUI installer, live model dropdowns, and `.env` defaults tuned for Nebius Token Factory.
+
 ## License
 
 MIT
