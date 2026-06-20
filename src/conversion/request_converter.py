@@ -488,6 +488,12 @@ def convert_claude_to_openai(
     openai_model = model_manager.map_claude_model_to_openai(
         claude_request.model, claude_request.messages
     )
+    # Token-aware long-context routing: escalate a text request whose prompt
+    # exceeds LONG_CONTEXT_THRESHOLD to LONG_CONTEXT_MODEL. Image requests keep
+    # the vision route (modality wins) and already send only the latest turn.
+    if not has_image and model_manager.long_context_enabled():
+        prompt_tokens = count_claude_request_tokens(claude_request)
+        openai_model = model_manager.apply_long_context(openai_model, prompt_tokens)
     logger.info(
         f"Selected model: {openai_model} for request with {len(claude_request.messages)} messages"
     )

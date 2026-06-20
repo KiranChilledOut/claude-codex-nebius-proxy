@@ -1,5 +1,9 @@
+import logging
+
 from src.core.config import config
 from src.models.claude import ClaudeMessage
+
+logger = logging.getLogger(__name__)
 
 
 class ModelManager:
@@ -88,6 +92,31 @@ class ModelManager:
             return self.config.big_model
         # Default to big model for unknown models
         return self.config.big_model
+
+    def long_context_enabled(self) -> bool:
+        """True when LONG_CONTEXT_MODEL is set and a positive threshold exists.
+        Lets callers skip prompt-token counting entirely when the feature is off."""
+        return bool(
+            getattr(self.config, "long_context_model", "")
+            and getattr(self.config, "long_context_threshold", 0) > 0
+        )
+
+    def apply_long_context(self, base_model: str, prompt_tokens: int) -> str:
+        """Escalate to the long-context model when the prompt exceeds the
+        configured threshold. No-op when the feature is disabled or the base
+        model is already the long-context model."""
+        lc_model = getattr(self.config, "long_context_model", "")
+        threshold = getattr(self.config, "long_context_threshold", 0)
+        if lc_model and threshold > 0 and base_model != lc_model and prompt_tokens > threshold:
+            logger.info(
+                "Long-context routing: prompt ~%d tokens > %d; routing %s -> %s",
+                prompt_tokens,
+                threshold,
+                base_model,
+                lc_model,
+            )
+            return lc_model
+        return base_model
 
 
 model_manager = ModelManager(config)

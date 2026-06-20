@@ -138,6 +138,7 @@ For full configuration options, model details, architecture, troubleshooting, an
 - Streaming SSE (Claude and Codex)
 - Server-side web search via Tavily (executes `web_search` tool calls, returns results to the model)
 - Automatic model routing (big / middle / small / vision)
+- Token-aware long-context routing (large prompts escalate to a long-context model)
 - Built-in request optimizations for Claude Code housekeeping
 - Tool-call JSON repair and deduplication
 - Context auto-truncation (never orphans tool results)
