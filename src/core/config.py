@@ -64,6 +64,20 @@ class Config:
         self.small_model = os.environ.get("SMALL_MODEL", "zai-org/GLM-4.5")
         self.vision_model = os.environ.get("VISION_MODEL", "Qwen/Qwen2.5-VL-72B-Instruct")
 
+        # --- Token-aware long-context routing ---
+        # Name-based routing (opus->BIG, sonnet->MIDDLE, haiku->SMALL) ignores how
+        # large the prompt actually is. When a text request's estimated prompt
+        # exceeds LONG_CONTEXT_THRESHOLD tokens, route it to LONG_CONTEXT_MODEL
+        # (e.g. a larger-context backend) instead of the name-mapped model. Image
+        # requests keep the vision route. Unset LONG_CONTEXT_MODEL = feature off.
+        self.long_context_model = os.environ.get("LONG_CONTEXT_MODEL", "").strip()
+        try:
+            self.long_context_threshold = int(
+                os.environ.get("LONG_CONTEXT_THRESHOLD", "60000") or 60000
+            )
+        except ValueError:
+            self.long_context_threshold = 60000
+
         # Force how thinking text is returned, overriding the client `display`
         # and the per-mode default. "" = honor the request (adaptive->omitted,
         # enabled->summarized). "summarized" = always surface backend reasoning
