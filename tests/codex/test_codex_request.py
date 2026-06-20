@@ -619,3 +619,112 @@ def test_empty_tools_dropped():
     request = _make_request(input="What is 2+2?")
     result = convert_responses_to_openai_chat(request, tool_ctx=fake_tool_ctx)
     assert "tools" not in result
+
+
+# ---------------------------------------------------------------------------
+# Leaked server-owned web_search calls are stripped from replayed history
+# ---------------------------------------------------------------------------
+def test_leaked_web_search_call_stripped_from_history():
+    """A web_search function_call that leaked to Codex (and its 'unsupported call'
+    output) must be dropped before reaching the backend — its arguments are
+    server-owned and can be malformed, causing a 400 on replay."""
+    request = _make_request(input=[
+        ResponsesItem(type="message", role="user", content="hi"),
+        ResponsesItem(type="function_call", name="web_search",
+                      arguments='{"query": "x"}', call_id="functions.web_search:1"),
+        ResponsesItem(type="function_call_output", call_id="functions.web_search:1",
+                      output="unsupported call: web_search"),
+        ResponsesItem(type="function_call", name="exec_command",
+                      arguments='{"cmd": "ls"}', call_id="functions.exec_command:2"),
+        ResponsesItem(type="function_call_output", call_id="functions.exec_command:2",
+                      output="files"),
+    ])
+    result = convert_responses_to_openai_chat(request)
+    msgs = result["messages"]
+
+    # No web_search tool call survives anywhere.
+    for m in msgs:
+        for tc in m.get("tool_calls") or []:
+            assert (tc.get("function") or {}).get("name") != "web_search"
+    # Its orphaned tool result is gone too.
+    assert all(m.get("tool_call_id") != "functions.web_search:1" for m in msgs)
+    # The legitimate client tool call and its result are preserved.
+    assert any(
+        (tc.get("function") or {}).get("name") == "exec_command"
+        for m in msgs for tc in (m.get("tool_calls") or [])
+    )
+    assert any(m.get("tool_call_id") == "functions.exec_command:2" for m in msgs)
+
+
+def test_batched_search_call_stripped_keeps_sibling_tool_call():
+    """When a turn batched web_search WITH a client tool in one assistant message,
+    only the web_search call is removed; the sibling client call stays."""
+    # session_items already in OpenAI format (proxy-stored), with a batched turn.
+    session_items = [
+        {"role": "assistant", "tool_calls": [
+            {"id": "s1", "type": "function",
+             "function": {"name": "web_search", "arguments": '{\\"query\\": \\"x\\"}'}},
+            {"id": "c1", "type": "function",
+             "function": {"name": "exec_command", "arguments": '{"cmd": "ls"}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "s1", "content": "unsupported call: web_search"},
+        {"role": "tool", "tool_call_id": "c1", "content": "files"},
+    ]
+    request = _make_request(input="next")
+    result = convert_responses_to_openai_chat(request, session_items=session_items)
+    msgs = result["messages"]
+
+    names = [(tc.get("function") or {}).get("name")
+             for m in msgs for tc in (m.get("tool_calls") or [])]
+    assert "web_search" not in names
+    assert "exec_command" in names
+    assert all(m.get("tool_call_id") != "s1" for m in msgs)
+    assert any(m.get("tool_call_id") == "c1" for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# Malformed tool-call arguments in history must not 400 the whole request
+# ---------------------------------------------------------------------------
+def test_malformed_tool_call_arguments_are_repaired():
+    """A model-emitted tool call with invalid-JSON arguments (e.g. unescaped
+    quotes in a heredoc) is replayed in history; left as-is the backend rejects
+    the entire request with a 400. The converter must coerce it to valid JSON."""
+    import json as _json
+    bad_args = '{"cmd": "cat <<EOF > a.xml\n<mxCell style="fillColor=none">\nEOF"}'  # unescaped quotes/newlines
+    # sanity: this really is invalid JSON
+    try:
+        _json.loads(bad_args); raise AssertionError("fixture should be invalid JSON")
+    except (ValueError, _json.JSONDecodeError):
+        pass
+
+    request = _make_request(input=[
+        ResponsesItem(type="message", role="user", content="draw it"),
+        ResponsesItem(type="function_call", name="exec_command",
+                      arguments=bad_args, call_id="functions.exec_command:9"),
+        ResponsesItem(type="function_call_output", call_id="functions.exec_command:9",
+                      output="ok"),
+    ])
+    result = convert_responses_to_openai_chat(request)
+
+    # Every tool_call argument that survives must be valid JSON now.
+    for m in result["messages"]:
+        for tc in m.get("tool_calls") or []:
+            args = (tc.get("function") or {}).get("arguments")
+            if args:
+                _json.loads(args)  # must not raise
+    # The call and its result are preserved (not dropped).
+    assert any(
+        (tc.get("function") or {}).get("name") == "exec_command"
+        for m in result["messages"] for tc in (m.get("tool_calls") or [])
+    )
+    assert any(m.get("tool_call_id") == "functions.exec_command:9" for m in result["messages"])
+
+
+def test_valid_tool_call_arguments_left_untouched():
+    request = _make_request(input=[
+        ResponsesItem(type="function_call", name="exec_command",
+                      arguments='{"cmd": "ls"}', call_id="c1"),
+    ])
+    result = convert_responses_to_openai_chat(request)
+    tc = next(tc for m in result["messages"] for tc in (m.get("tool_calls") or []))
+    assert tc["function"]["arguments"] == '{"cmd": "ls"}'

@@ -203,7 +203,22 @@ async def convert_openai_sse_to_responses_sse(
         part={"type": "output_text", "text": ""},
     )
 
-    async for line in openai_sse_stream:
+    # Iterate the upstream defensively. response.created/in_progress were already
+    # emitted, so an error raised while reading the upstream (e.g. a 400 surfaced
+    # during stream setup) must NOT propagate — re-raising past a started ASGI
+    # response triggers "response already started" and disconnects the client.
+    # Capture it and surface the failure as assistant text with a clean terminal
+    # sequence instead.
+    err_holder: Dict[str, Any] = {}
+
+    async def _safe_source(src: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
+        try:
+            async for item in src:
+                yield item
+        except (Exception, GeneratorExit) as exc:  # noqa: BLE001 — includes GeneratorExit on client disconnect
+            err_holder["error"] = exc
+
+    async for line in _safe_source(openai_sse_stream):
         if not line.strip() or not line.startswith("data:"):
             continue
         data = line[len("data:"):].strip()
@@ -365,6 +380,34 @@ async def convert_openai_sse_to_responses_sse(
             if usage:
                 state.input_tokens = usage.get("prompt_tokens", 0)
                 state.output_tokens = usage.get("completion_tokens", 0)
+
+    # --- 4b. Upstream error: surface it as assistant text, then close cleanly ---
+    # GeneratorExit (client disconnect) should NOT be surfaced as an error;
+    # it indicates the consumer closed the generator after reading everything.
+    if isinstance(err_holder.get("error"), GeneratorExit):
+        err_holder["error"] = None
+
+    if err_holder.get("error") is not None:
+        exc = err_holder["error"]
+        detail = getattr(exc, "detail", None) or str(exc) or type(exc).__name__
+        notice = (
+            f"\n\n[proxy] upstream error: {detail}"
+            if state.text_buf
+            else f"[proxy] upstream error: {detail}"
+        )
+        state.text_buf += notice
+        state.seq += 1
+        yield _ev(
+            "response.output_text.delta",
+            seq=state.seq,
+            response=ev,
+            item_id=msg_id,
+            output_index=0,
+            content_index=0,
+            delta=notice,
+        )
+        if accumulator is not None:
+            accumulator["error"] = str(detail)
 
     # --- 5. output_text.done ---
     state.seq += 1

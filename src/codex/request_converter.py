@@ -1,5 +1,6 @@
 """Convert Codex Responses API requests to OpenAI Chat Completions format."""
 
+import json
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from src.codex.models import ResponsesItem, ResponsesRequest
@@ -211,6 +212,82 @@ def _default_map_codex_model(codex_model: str) -> str:
 # ---------------------------------------------------------------------------
 # Main conversion
 # ---------------------------------------------------------------------------
+# Tool names the proxy executes server-side (Tavily). Calls to these never belong
+# in a backend request: when the model batches one with a client tool the proxy
+# can't intercept it, so it leaks to Codex (which answers "unsupported call") and
+# the malformed, double-escaped arguments come back on the next turn and 400 the
+# backend. Drop them (and their orphaned outputs) on the way in.
+_SERVER_SEARCH_NAMES = {"web_search", "websearch"}
+
+
+def _strip_leaked_search_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove server-owned search tool calls and their dangling tool results."""
+    dropped_ids: set = set()
+    out: List[Dict[str, Any]] = []
+    for msg in messages:
+        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if tool_calls:
+            kept = []
+            for tc in tool_calls:
+                name = ((tc.get("function") or {}).get("name") or "").lower()
+                if name in _SERVER_SEARCH_NAMES:
+                    if tc.get("id"):
+                        dropped_ids.add(tc.get("id"))
+                else:
+                    kept.append(tc)
+            if len(kept) == len(tool_calls):
+                out.append(msg)
+            elif kept:
+                out.append({**msg, "tool_calls": kept})
+            elif msg.get("content"):
+                # Preserve any assistant text; drop the now-empty tool_calls.
+                out.append({k: v for k, v in msg.items() if k != "tool_calls"})
+            # else: assistant turn was only search calls -> drop entirely
+        else:
+            out.append(msg)
+
+    if not dropped_ids:
+        return out
+    return [
+        m for m in out
+        if not (isinstance(m, dict) and m.get("role") == "tool"
+                and m.get("tool_call_id") in dropped_ids)
+    ]
+
+
+def _sanitize_tool_call_arguments(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ensure every replayed assistant tool call carries valid-JSON arguments.
+
+    Models occasionally emit tool-call arguments that are not valid JSON — e.g. a
+    large ``cmd`` whose embedded XML/quotes/newlines aren't escaped. Replayed in
+    history, the backend fails to parse that one call and rejects the ENTIRE
+    request with a 400 ("Unterminated string ..."), which kills the whole session.
+    The call has already executed (its result is in history), so we preserve the
+    original text inside a valid JSON wrapper rather than letting it poison every
+    subsequent turn.
+    """
+    out: List[Dict[str, Any]] = []
+    for msg in messages:
+        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if not tool_calls:
+            out.append(msg)
+            continue
+        new_calls = []
+        changed = False
+        for tc in tool_calls:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            args = fn.get("arguments") if isinstance(fn, dict) else None
+            if isinstance(args, str) and args.strip():
+                try:
+                    json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    tc = {**tc, "function": {**fn, "arguments": json.dumps({"_raw_arguments": args})}}
+                    changed = True
+            new_calls.append(tc)
+        out.append({**msg, "tool_calls": new_calls} if changed else msg)
+    return out
+
+
 def convert_responses_to_openai_chat(
     request: ResponsesRequest,
     session_items: Optional[List[ResponsesItem]] = None,
@@ -250,6 +327,11 @@ def convert_responses_to_openai_chat(
             msg = _convert_item_to_message(item)
             if msg is not None:
                 messages.append(msg)
+
+    # Drop leaked server-owned search calls, then make sure any malformed
+    # tool-call arguments can't 400 the whole request on replay.
+    messages = _strip_leaked_search_calls(messages)
+    messages = _sanitize_tool_call_arguments(messages)
 
     # --- Model ---
     if model_manager is not None:
