@@ -153,6 +153,127 @@ async def test_loop_handles_kimi_token_args(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# run_search_loop_streaming
+# --------------------------------------------------------------------------
+import json
+
+
+def _content_chunk(text):
+    return "data: " + json.dumps({"choices": [{"delta": {"content": text}}]})
+
+
+def _toolcall_chunk(idx, cid, name, args):
+    return "data: " + json.dumps({"choices": [{"delta": {"tool_calls": [
+        {"index": idx, "id": cid, "function": {"name": name, "arguments": args}}]}}]})
+
+
+def _finish_chunk(reason="stop", usage=None):
+    ch = {"choices": [{"delta": {}, "finish_reason": reason}]}
+    if usage:
+        ch["usage"] = usage
+    return "data: " + json.dumps(ch)
+
+
+_DONE = "data: [DONE]"
+
+
+class _FakeStreamClient:
+    """Fake openai_client whose create_chat_completion_stream replays canned turns."""
+
+    def __init__(self, turns):
+        self._turns = list(turns)  # each turn: list[str] of SSE lines (incl. DONE)
+        self.calls = []
+
+    async def create_chat_completion_stream(self, req, request_id=None):
+        self.calls.append({"messages": list(req.get("messages", []))})
+        for line in self._turns.pop(0):
+            yield line
+
+
+async def _collect(agen):
+    return [x async for x in agen]
+
+
+@pytest.mark.asyncio
+async def test_streaming_passthrough_no_search(monkeypatch):
+    """A normal answer turn streams content through live and is never intercepted."""
+    called = {"n": 0}
+
+    async def fake_search(q):
+        called["n"] += 1
+        return "RESULTS"
+
+    monkeypatch.setattr(server_tools, "tavily_search", fake_search)
+    turns = [[_content_chunk("Hello "), _content_chunk("world"),
+              _finish_chunk("stop", {"prompt_tokens": 1, "completion_tokens": 2}), _DONE]]
+    client = _FakeStreamClient(turns)
+
+    out = await _collect(server_tools.run_search_loop_streaming(
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}]}, client, "rid"))
+
+    text = "".join(out)
+    assert "Hello " in text and "world" in text
+    assert out[-1].strip() == "data: [DONE]"  # exactly one terminating DONE
+    assert sum(1 for x in out if x.strip() == "data: [DONE]") == 1
+    assert called["n"] == 0  # no search executed
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_intercepts_search_then_streams_answer(monkeypatch):
+    """A pure web_search turn is executed server-side and never forwarded; the
+    follow-up answer streams to the client."""
+    seen = {}
+
+    async def fake_search(q):
+        seen["q"] = q
+        return "RESULTS for " + q
+
+    monkeypatch.setattr(server_tools, "tavily_search", fake_search)
+    turn1 = [_toolcall_chunk(0, "t1", "web_search", '{"query":"spacex"}'),
+             _finish_chunk("tool_calls"), _DONE]
+    turn2 = [_content_chunk("SpaceX launches tomorrow."), _finish_chunk("stop"), _DONE]
+    client = _FakeStreamClient([turn1, turn2])
+
+    out = await _collect(server_tools.run_search_loop_streaming(
+        {"model": "m", "messages": [{"role": "user", "content": "when"}]}, client, "rid"))
+
+    text = "".join(out)
+    assert seen["q"] == "spacex"
+    assert "SpaceX launches tomorrow." in text
+    assert "web_search" not in text  # the search tool call never reaches the client
+    assert "tool_calls" not in text
+    assert sum(1 for x in out if x.strip() == "data: [DONE]") == 1
+    # second backend turn must carry the tool result
+    assert any(m.get("role") == "tool" and "RESULTS for spacex" in (m.get("content") or "")
+               for m in client.calls[1]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_streaming_passes_through_client_tool_calls(monkeypatch):
+    """A non-search (client) tool call is forwarded unchanged; no search round-trip."""
+    called = {"n": 0}
+
+    async def fake_search(q):
+        called["n"] += 1
+        return "x"
+
+    monkeypatch.setattr(server_tools, "tavily_search", fake_search)
+    turn1 = [_toolcall_chunk(0, "b", "Bash", '{"cmd":"ls"}'),
+             _finish_chunk("tool_calls"), _DONE]
+    client = _FakeStreamClient([turn1])
+
+    out = await _collect(server_tools.run_search_loop_streaming(
+        {"model": "m", "messages": []}, client, "rid"))
+
+    text = "".join(out)
+    assert "Bash" in text  # client tool call forwarded
+    assert called["n"] == 0
+    assert len(client.calls) == 1
+    assert out[-1].strip() == "data: [DONE]"
+
+
+# --------------------------------------------------------------------------
 # system-prompt nudge (call search on its own turn)
 # --------------------------------------------------------------------------
 from src.conversion.request_converter import convert_claude_to_openai

@@ -5,7 +5,7 @@ import time
 import traceback
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -14,7 +14,7 @@ from src.codex.models import ResponsesItem, ResponsesRequest, ResponsesResponse,
 from src.codex.request_converter import convert_responses_to_openai_chat
 from src.codex.response_converter import convert_openai_to_responses
 from src.codex.session import SessionStore
-from src.codex.stream_converter import codex_response_to_sse, convert_openai_sse_to_responses_sse
+from src.codex.stream_converter import convert_openai_sse_to_responses_sse
 from src.codex.tools_compat import parse_codex_tools
 from src.api.optimization_handlers import optimized_response_to_sse, try_local_optimization
 from src.ensemble.approval import approval_store
@@ -269,9 +269,10 @@ async def create_response(
             and config.server_search_enabled
         )
 
-        if needs_search:
-            # The search loop is non-streaming by design (multiple chat.completions
-            # calls are run internally).
+        if needs_search and not request.stream:
+            # Non-streaming client: run the buffered search loop and return a
+            # complete response. (The streaming client is handled below by
+            # run_search_loop_streaming, which preserves token streaming.)
             openai_request["stream"] = False
             openai_request.pop("stream_options", None)
             openai_response = await server_tools.run_search_loop(
@@ -324,21 +325,7 @@ async def create_response(
                 previous_id=session_id,
             )
 
-            if not request.stream:
-                return codex_response
-
-            # Streaming: synthesise SSE from the complete response
-            async def search_sse_stream():
-                async for event in codex_response_to_sse(
-                    codex_response, request_model=backend_model or request.model
-                ):
-                    yield event
-
-            return StreamingResponse(
-                search_sse_stream(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-            )
+            return codex_response
 
         # Non-streaming
         if not request.stream:
@@ -392,8 +379,17 @@ async def create_response(
 
             return codex_response
 
-        # Streaming
-        openai_stream = openai_client.create_chat_completion_stream(openai_request, request_id)
+        # Streaming. When server-side search is engaged, use the streaming search
+        # loop, which executes owned search tools server-side while still streaming
+        # tokens to the client; otherwise stream the backend directly.
+        if needs_search:
+            openai_request.pop("stream", None)
+            openai_request.pop("stream_options", None)
+            openai_stream = server_tools.run_search_loop_streaming(
+                openai_request, openai_client, request_id
+            )
+        else:
+            openai_stream = openai_client.create_chat_completion_stream(openai_request, request_id)
 
         async def codex_sse_stream():
             stream_status = "success"
@@ -411,6 +407,12 @@ async def create_response(
                 stream_status = "error"
                 stream_error = str(exc)
                 raise
+            else:
+                # The converter handles upstream failures inline (it cannot raise
+                # once the SSE response has started) and records them here.
+                if accumulator.get("error"):
+                    stream_status = "error"
+                    stream_error = accumulator["error"]
             finally:
                 observability_recorder.record_request(
                     request_id=request_id,

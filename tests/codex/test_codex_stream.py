@@ -657,3 +657,53 @@ async def test_stream_parses_embedded_tool_calls_from_content():
     text_deltas = [_parse_event(ev) for ev in events if _parse_event(ev)["type"] == "response.output_text.delta"]
     for td in text_deltas:
         assert "functions.exec_command" not in td["delta"]
+
+
+# --------------------------------------------------------------------------
+# Upstream error mid-stream must NOT disconnect: the converter surfaces the
+# error as output text and closes with a valid terminal event sequence.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_upstream_error_closes_stream_gracefully():
+    from fastapi import HTTPException
+
+    async def failing_source():
+        # Raises on first iteration, before any chunk — mirrors a 400 raised
+        # during stream setup inside the body iterator.
+        if False:
+            yield ""  # pragma: no cover — make this an async generator
+        raise HTTPException(status_code=400, detail="Bad upstream request")
+
+    acc: Dict[str, Any] = {}
+    events = await _collect(
+        convert_openai_sse_to_responses_sse(failing_source(), "gpt-4", accumulator=acc)
+    )
+
+    types = [_parse_event(e)["type"] for e in events]
+    # Stream is well-formed: starts with created, ends with completed (no raise).
+    assert types[0] == "response.created"
+    assert types[-1] == "response.completed"
+    # The error surfaced to the user as assistant text.
+    joined = "".join(events)
+    assert "Bad upstream request" in joined
+    # And the wrapper can detect the failure for observability.
+    assert acc.get("error")
+
+
+@pytest.mark.asyncio
+async def test_upstream_error_after_partial_text_keeps_text():
+    from fastapi import HTTPException
+
+    async def partial_then_fail():
+        yield 'data: ' + json.dumps({"choices": [{"delta": {"content": "Partial answer"}}]}) + "\n\n"
+        raise HTTPException(status_code=500, detail="boom")
+
+    events = await _collect(
+        convert_openai_sse_to_responses_sse(partial_then_fail(), "gpt-4")
+    )
+    types = [_parse_event(e)["type"] for e in events]
+    assert types[-1] == "response.completed"
+    joined = "".join(events)
+    assert "Partial answer" in joined  # already-streamed text preserved
+    assert "boom" in joined            # error appended

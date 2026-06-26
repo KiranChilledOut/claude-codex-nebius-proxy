@@ -11,7 +11,8 @@ When ``TAVILY_API_KEY`` is unset (or ``SERVER_SEARCH_ENABLED=false``) this modul
 is inert and the proxy behaves exactly as before.
 """
 
-from typing import Any, Dict, List
+import json
+from typing import Any, AsyncGenerator, Dict, List
 
 import httpx
 
@@ -168,3 +169,121 @@ async def run_search_loop(openai_request: Dict[str, Any], openai_client, request
     req.pop("tool_choice", None)
     response = await openai_client.create_chat_completion(req, request_id)
     return response
+
+
+async def run_search_loop_streaming(
+    openai_request: Dict[str, Any], openai_client, request_id
+) -> AsyncGenerator[str, None]:
+    """Streaming variant of :func:`run_search_loop`.
+
+    Yields OpenAI chat-completion SSE strings (``data: {chunk}`` ... ``data: [DONE]``)
+    in the exact shape :func:`convert_openai_sse_to_responses_sse` consumes, so the
+    proxy can keep streaming tokens to the client while still executing server-owned
+    search tools.
+
+    Content/reasoning deltas are forwarded the instant they arrive — the common
+    no-search turn streams live with no buffering, which is what restores Codex's
+    token-by-token output. Tool-call and finish chunks are withheld until the turn
+    completes; only then can we apply :func:`run_search_loop`'s contract (a turn whose
+    tool calls are *all* server-owned searches is executed here and fed back, never
+    forwarded). Any other turn is released verbatim. Intercepted search turns emit no
+    ``[DONE]``, so the whole exchange reaches the client as one continuous response.
+    """
+    # Imported lazily to keep module import order simple (mirrors run_search_loop).
+    from src.conversion.response_converter import _finalize_tool_args
+
+    req = dict(openai_request)
+    # create_chat_completion_stream sets stream/stream_options itself.
+    req.pop("stream", None)
+    req.pop("stream_options", None)
+    messages = list(req.get("messages", []))
+    max_iters = max(1, config.server_search_max_iters)
+
+    for iteration in range(max_iters):
+        req["messages"] = messages
+        assembled: Dict[int, Dict[str, Any]] = {}
+        withheld: List[str] = []  # tool-call + finish/usage chunks, pending decision
+
+        async for sse in openai_client.create_chat_completion_stream(req, request_id):
+            stripped = sse.strip()
+            if stripped == "data: [DONE]":
+                break
+            payload = stripped[len("data:"):].strip() if stripped.startswith("data:") else ""
+            try:
+                chunk = json.loads(payload)
+            except (json.JSONDecodeError, ValueError):
+                yield sse  # unparseable: forward verbatim
+                continue
+
+            choices = chunk.get("choices") or []
+            delta = (choices[0].get("delta") or {}) if choices else {}
+            finish = choices[0].get("finish_reason") if choices else None
+
+            tcs = delta.get("tool_calls")
+            if tcs:
+                for tcd in tcs:
+                    idx = tcd.get("index", 0)
+                    slot = assembled.setdefault(idx, {"id": None, "name": "", "arguments": ""})
+                    if tcd.get("id"):
+                        slot["id"] = tcd["id"]
+                    fn = tcd.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["arguments"] += fn["arguments"]
+                withheld.append(sse)
+                continue
+
+            if finish is not None or not choices:
+                # finish marker or usage-only chunk: withhold until we decide.
+                withheld.append(sse)
+                continue
+
+            # Plain content / reasoning / role delta: stream live.
+            yield sse
+
+        tool_calls = [assembled[i] for i in sorted(assembled)]
+        search_calls = [t for t in tool_calls if is_search_tool_name(t["name"])]
+        pure_search = bool(tool_calls) and len(search_calls) == len(tool_calls)
+
+        if pure_search and iteration < max_iters - 1:
+            # Execute the searches and continue; the withheld search-call chunks are
+            # intentionally dropped so they never reach the client.
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": t["id"],
+                            "type": "function",
+                            "function": {"name": t["name"], "arguments": t["arguments"]},
+                        }
+                        for t in tool_calls
+                    ],
+                }
+            )
+            for t in search_calls:
+                _, _, parsed = _finalize_tool_args(t["name"], t["arguments"] or "{}")
+                parsed = parsed or {}
+                query = parsed.get("query") or parsed.get("q") or ""
+                result = await tavily_search(query)
+                logger.info(f"[server_tools] executed web_search query={query!r}")
+                messages.append(
+                    {"role": "tool", "tool_call_id": t["id"], "content": result}
+                )
+            continue
+
+        # Passthrough / final turn: release withheld chunks, then terminate.
+        for s in withheld:
+            yield s
+        yield "data: [DONE]"
+        return
+
+    # Max iterations reached while still searching: drop the search tools and stream
+    # a forced final answer verbatim (its own [DONE] terminates the stream).
+    req["messages"] = messages
+    req.pop("tools", None)
+    req.pop("tool_choice", None)
+    async for sse in openai_client.create_chat_completion_stream(req, request_id):
+        yield sse
