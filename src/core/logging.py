@@ -24,13 +24,7 @@ class UvicornAccessFilter(logging.Filter):
     """
 
     NOISY_PREFIXES = (
-        "/api/observability/sessions",
-        "/api/observability/summary",
-        "/api/observability/requests",
-        "/api/observability/failures",
-        "/api/observability/tool-calls",
-        "/api/observability/config",
-        "/api/observability/context-usage",
+        "/api/observability",
         "/dashboard",
         "/dashboard/assets",
     )
@@ -39,12 +33,12 @@ class UvicornAccessFilter(logging.Filter):
         msg = record.getMessage()
         # At WARNING or above: drop all 200 OKs regardless of path.
         if LOG_LEVEL in ("WARNING", "WARN", "ERROR", "CRITICAL"):
-            if " 200 OK" in msg:
+            if " 200" in msg:
                 return False
             return True  # errors/warnings still pass through.
 
         # At INFO: suppress dashboard polls only.
-        if " 200 OK" not in msg:
+        if " 200" not in msg:
             return True
         for prefix in self.NOISY_PREFIXES:
             if prefix in msg:
@@ -61,3 +55,6 @@ for uvicorn_logger in ["uvicorn", "uvicorn.error"]:
 _uvicorn_access = logging.getLogger("uvicorn.access")
 _uvicorn_access.setLevel(logging.INFO)
 _uvicorn_access.addFilter(UvicornAccessFilter())
+
+# sujee
+logging.getLogger("src.observability").setLevel(logging.WARNING)
