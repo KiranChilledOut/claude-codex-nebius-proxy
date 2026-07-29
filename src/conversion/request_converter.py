@@ -644,6 +644,21 @@ def _coalesce_consecutive_roles(messages: List[Dict[str, Any]]) -> List[Dict[str
     return out
 
 
+def _hoist_system_messages_to_front(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Move any system messages to the front, preserving their relative order.
+
+    OpenAI-style backends often require the system message to come first.
+    Conversion above handles the top-level `claude_request.system` prompt, but
+    inline system turns inside `claude_request.messages` would otherwise sit
+    wherever they appeared in the conversation.
+    """
+    if not messages:
+        return messages
+    system = [m for m in messages if isinstance(m, dict) and m.get("role") == Constants.ROLE_SYSTEM]
+    non_system = [m for m in messages if not (isinstance(m, dict) and m.get("role") == Constants.ROLE_SYSTEM)]
+    return system + non_system
+
+
 def _is_text_only(content: Any) -> bool:
     """True when content can be flattened to text without losing a block.
 
@@ -822,6 +837,11 @@ def convert_claude_to_openai(
     # well-formed conversation.
     openai_messages = _compact_large_tool_results(openai_messages)
     openai_messages = _coalesce_consecutive_roles(openai_messages)
+
+    # Strict backends (e.g. Nebius) require the system message to be first. Some
+    # Anthropic clients emit inline system turns inside `messages`; hoist them
+    # to the front so they precede user/assistant/tool turns.
+    openai_messages = _hoist_system_messages_to_front(openai_messages)
 
     prompt_estimate = _estimate_prompt_tokens(openai_messages)
     raw_available = context_limit - prompt_estimate - tool_overhead - 2048

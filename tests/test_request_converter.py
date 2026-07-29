@@ -2,6 +2,8 @@ import base64
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.conversion.request_converter import (
     TOKEN_ESTIMATE_BUFFER,
@@ -109,6 +111,62 @@ def test_image_request_drops_tools_and_sets_none():
     # Should drop tools and force tool_choice none
     assert "tools" not in openai_request
     assert openai_request.get("tool_choice") == "none"
+
+
+def test_inline_system_message_hoisted_to_front():
+    """A system turn inside messages must come first for strict backends."""
+    request = ClaudeMessagesRequest(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=64,
+        messages=[
+            ClaudeMessage(role="user", content="Hello"),
+            ClaudeMessage(role="system", content="You are a helpful assistant."),
+        ],
+    )
+
+    openai_request = convert_claude_to_openai(request, model_manager)
+
+    assert openai_request["messages"][0] == {
+        "role": "system",
+        "content": "You are a helpful assistant.",
+    }
+    assert openai_request["messages"][1] == {"role": "user", "content": "Hello"}
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [ClaudeMessage(role="system", content="Sys"), ClaudeMessage(role="user", content="Hi")],
+        [
+            ClaudeMessage(role="user", content="Hi"),
+            ClaudeMessage(role="assistant", content="Hello"),
+            ClaudeMessage(role="system", content="Sys"),
+        ],
+        [
+            ClaudeMessage(role="user", content="A"),
+            ClaudeMessage(role="system", content="S1"),
+            ClaudeMessage(role="assistant", content="B"),
+            ClaudeMessage(role="system", content="S2"),
+        ],
+    ],
+)
+def test_top_level_system_prompt_and_inline_system_ordered(messages):
+    """Top-level system prompt plus inline system turns all end up at the front."""
+    request = ClaudeMessagesRequest(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=64,
+        system="Top-level prompt",
+        messages=messages,
+    )
+
+    openai_request = convert_claude_to_openai(request, model_manager)
+    roles = [m.get("role") for m in openai_request["messages"]]
+
+    # All system messages precede any user/assistant turns.
+    first_non_system = next((i for i, r in enumerate(roles) if r != "system"), len(roles))
+    assert all(r == "system" for r in roles[:first_non_system])
+    assert "system" not in roles[first_non_system:]
+
 
 
 def test_followup_without_image_keeps_tools_and_model():
