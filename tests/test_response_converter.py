@@ -314,3 +314,304 @@ def test_scale_usage_for_client_scales_input_side_only():
     assert scaled["output_tokens"] == 50
     # scale 1.0 is a no-op passthrough
     assert scale_usage_for_client(usage, 1.0) is usage
+
+
+# --------------------------------------------------------------------------
+# Inline-text tool-call lifter: when a backend (e.g. moonshotai/Kimi-K2.7-Code)
+# emits tool calls as `  ...  `
+# control tokens inside `delta.content` (instead of structured `delta.tool_calls`),
+# the streaming converter must lift them into proper `tool_use` content blocks
+# with `stop_reason: tool_use` so Claude Code actually runs the tool.
+# --------------------------------------------------------------------------
+
+# Production-log blob (Kimi-K2.7-Code). Notably the token after ` `
+# is a bare tool-call id (chatcmpl-tool-...) NOT a `functions.NAME:N` form, so the
+# function name must be recovered from the args' keys.
+_BASH_TOOL = {
+    "name": "Bash",
+    "description": "Run a bash command",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "description": {"type": "string"},
+            "timeout": {"type": "number"},
+        },
+    },
+}
+_READ_TOOL = {
+    "name": "Read",
+    "description": "Read a file",
+    "input_schema": {
+        "type": "object",
+        "properties": {"file_path": {"type": "string"}},
+    },
+}
+
+_SECTION_BEGIN = "<" + "|tool_calls_section_begin" + "|>"
+_SECTION_END = "<" + "|tool_calls_section_end" + "|>"
+_CALL_BEGIN = "<" + "|tool_call_begin" + "|>"
+_ARG_BEGIN = "<" + "|tool_call_argument_begin" + "|>"
+_CALL_END = "<" + "|tool_call_end" + "|>"
+
+
+_INLINE_KIMI_BLOB = (
+    ' The clone failed. Let me verify the cert status. '
+    + _SECTION_BEGIN + ' ' + _CALL_BEGIN + ' '
+    + 'chatcmpl-tool-9d65acabff1f47df ' + _ARG_BEGIN + ' '
+    + '{"command": "ssh-keygen -L", "description": "Check SSH cert validity"} '
+    + _CALL_END + ' ' + _SECTION_END
+)
+
+
+def _request_with_tools(tools):
+    return ClaudeMessagesRequest(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=64,
+        messages=[ClaudeMessage(role="user", content="run it")],
+        stream=True,
+        tools=tools,
+    )
+
+
+async def _inline_tool_stream(text):
+    yield "data: " + json.dumps(
+        {"choices": [{"delta": {"content": text}, "finish_reason": None}]}
+    )
+    yield "data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+    yield "data: [DONE]"
+
+
+async def _inline_tool_stream_split(part_a, part_b):
+    yield "data: " + json.dumps(
+        {"choices": [{"delta": {"content": part_a}, "finish_reason": None}]}
+    )
+    yield "data: " + json.dumps(
+        {"choices": [{"delta": {"content": part_b}, "finish_reason": None}]}
+    )
+    yield "data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+    yield "data: [DONE]"
+
+
+@pytest.mark.asyncio
+async def test_streaming_lifts_inline_kimi_tool_call():
+    request = _request_with_tools([_BASH_TOOL, _READ_TOOL])
+    events = []
+    async for event in convert_openai_streaming_to_claude_with_cancellation(
+        _inline_tool_stream(_INLINE_KIMI_BLOB),
+        request,
+        _DummyLogger(),
+        _DummyRequest(),
+        _DummyClient(),
+        "req_inline_1",
+    ):
+        events.append(event)
+    serialized = "".join(events)
+
+    # Preceding prose still surfaces as text.
+    assert "Let me verify the cert status" in serialized
+    # Raw control tokens must NOT leak into the client stream.
+    assert _SECTION_BEGIN not in serialized
+    assert _CALL_BEGIN not in serialized
+    # A proper tool_use block is lifted, with the name recovered from the
+    # `command` arg key against the request's Bash tool schema.
+    assert '"type": "tool_use"' in serialized
+    assert '"name": "Bash"' in serialized
+    assert "ssh-keygen -L" in serialized
+    # Turn must end as tool_use so Claude Code runs the tool.
+    assert '"stop_reason": "tool_use"' in serialized
+
+
+@pytest.mark.asyncio
+async def test_streaming_lifts_inline_tool_call_split_across_chunks():
+    # Split the blob right in the middle of the section-begin token so the
+    # hold-back guard must buffer across the chunk boundary.
+    split_at = _INLINE_KIMI_BLOB.index(_SECTION_BEGIN) + 3
+    part_a, part_b = _INLINE_KIMI_BLOB[:split_at], _INLINE_KIMI_BLOB[split_at:]
+    request = _request_with_tools([_BASH_TOOL, _READ_TOOL])
+    events = []
+    async for event in convert_openai_streaming_to_claude_with_cancellation(
+        _inline_tool_stream_split(part_a, part_b),
+        request,
+        _DummyLogger(),
+        _DummyRequest(),
+        _DummyClient(),
+        "req_inline_2",
+    ):
+        events.append(event)
+    serialized = "".join(events)
+
+    assert _SECTION_BEGIN not in serialized
+    assert '"type": "tool_use"' in serialized
+    assert '"name": "Bash"' in serialized
+    assert "ssh-keygen -L" in serialized
+    assert '"stop_reason": "tool_use"' in serialized
+
+
+@pytest.mark.asyncio
+async def test_streaming_inline_tool_call_unknown_name_falls_back():
+    # Args keys match no tool in the request; the lifter must still emit a
+    # tool_use block so the turn stays executable instead of dying as text.
+    blob = (
+        _SECTION_BEGIN + ' ' + _CALL_BEGIN + ' '
+        + 'chatcmpl-tool-deadbeef ' + _ARG_BEGIN + ' '
+        + '{"weird_key": "value"} ' + _CALL_END + ' ' + _SECTION_END
+    )
+    request = _request_with_tools([_READ_TOOL])
+    events = []
+    async for event in convert_openai_streaming_to_claude_with_cancellation(
+        _inline_tool_stream(blob),
+        request,
+        _DummyLogger(),
+        _DummyRequest(),
+        _DummyClient(),
+        "req_inline_3",
+    ):
+        events.append(event)
+    serialized = "".join(events)
+
+    assert '"type": "tool_use"' in serialized
+    assert "weird_key" in serialized
+    assert '"stop_reason": "tool_use"' in serialized
+    assert _SECTION_BEGIN not in serialized
+
+
+
+@pytest.mark.asyncio
+async def test_nonstreaming_lifts_inline_kimi_tool_call():
+    """Non-streaming convert_openai_to_claude_response also lifts inline-text
+    tool calls (same backend glitch, different code path)."""
+    _SEC = "<" + "|tool_calls_section_begin" + "|>"
+    _END = "<" + "|tool_calls_section_end" + "|>"
+    _CB = "<" + "|tool_call_begin" + "|>"
+    _AB = "<" + "|tool_call_argument_begin" + "|>"
+    _CE = "<" + "|tool_call_end" + "|>"
+    request = ClaudeMessagesRequest(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=64,
+        messages=[ClaudeMessage(role="user", content="run it")],
+        tools=[_BASH_TOOL, _READ_TOOL],
+    )
+    text = (
+        " The clone failed. "
+        + _SEC + " " + _CB + " chatcmpl-tool-abc " + _AB + " "
+        + "{\"command\": \"ssh-keygen -L\", \"description\": \"d\"} "
+        + _CE + " " + _END
+    )
+    openai_response = {
+        "id": "resp_n1",
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": text, "tool_calls": []},
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+    resp = convert_openai_to_claude_response(openai_response, request)
+
+    assert resp["stop_reason"] == "tool_use"
+    tool_uses = [b for b in resp["content"] if b.get("type") == "tool_use"]
+    assert tool_uses[0]["name"] == "Bash"
+    assert tool_uses[0]["input"]["command"] == "ssh-keygen -L"
+    # Raw control tokens must not survive into any content block.
+    assert _SEC not in json.dumps(resp["content"])
+    # Prose text still surfaced.
+    texts = [b for b in resp["content"] if b.get("type") == "text"]
+    assert any("clone failed" in b["text"] for b in texts)
+
+
+# --------------------------------------------------------------------------
+# Kimi-K2.7-Code bare-args variant (production logs.txt, 2026-07-20): the
+# <|tool_call_argument_begin|> token is omitted entirely — the args JSON
+# follows the bare tool-call id directly:
+#   <|tool_call_begin|> chatcmpl-tool-<hex>   {"file_path": ...} <|tool_call_end|>
+# --------------------------------------------------------------------------
+
+_WRITE_TOOL = {
+    "name": "Write",
+    "description": "Write a file",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string"},
+            "content": {"type": "string"},
+        },
+    },
+}
+
+_INLINE_KIMI_BARE_BLOB = (
+    ' Now creating the DSL file. '
+    + _SECTION_BEGIN + ' ' + _CALL_BEGIN + ' '
+    + 'chatcmpl-tool-a06b5f9a1e9a6e0b6   '
+    + '{"file_path": "/tmp/AzureAiPlatform_Teams_ItsNagnt.kt", "content": "package foo\\n"} '
+    + _CALL_END + ' ' + _SECTION_END
+)
+
+
+@pytest.mark.asyncio
+async def test_streaming_lifts_inline_kimi_bare_args_tool_call():
+    """Args JSON directly after the id (no <|tool_call_argument_begin|>) must
+    still be lifted into a tool_use block, with the name recovered from the
+    args keys against the Write tool schema."""
+    request = _request_with_tools([_BASH_TOOL, _READ_TOOL, _WRITE_TOOL])
+    events = []
+    async for event in convert_openai_streaming_to_claude_with_cancellation(
+        _inline_tool_stream(_INLINE_KIMI_BARE_BLOB),
+        request,
+        _DummyLogger(),
+        _DummyRequest(),
+        _DummyClient(),
+        "req_inline_bare_1",
+    ):
+        events.append(event)
+    serialized = "".join(events)
+
+    # Preceding prose still surfaces as text.
+    assert "Now creating the DSL file" in serialized
+    # Raw control tokens and the bare id/args must NOT leak as text.
+    assert _SECTION_BEGIN not in serialized
+    assert _CALL_BEGIN not in serialized
+    # Lifted tool_use with the name recovered from file_path+content keys.
+    assert '"type": "tool_use"' in serialized
+    assert '"name": "Write"' in serialized
+    assert "AzureAiPlatform_Teams_ItsNagnt.kt" in serialized
+    assert '"stop_reason": "tool_use"' in serialized
+
+
+def test_nonstreaming_lifts_inline_kimi_bare_args_tool_call():
+    """Non-streaming path lifts the bare-args variant and strips the whole
+    section (id + args included) from visible text."""
+    request = ClaudeMessagesRequest(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=64,
+        messages=[ClaudeMessage(role="user", content="write it")],
+        tools=[_BASH_TOOL, _READ_TOOL, _WRITE_TOOL],
+    )
+    text = (
+        " Writing the file now. "
+        + _SECTION_BEGIN + " " + _CALL_BEGIN + " chatcmpl-tool-abc123   "
+        + '{"file_path": "/tmp/a.kt", "content": "hi"} '
+        + _CALL_END + " " + _SECTION_END
+    )
+    openai_response = {
+        "id": "resp_bare_n1",
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": text, "tool_calls": []},
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+    resp = convert_openai_to_claude_response(openai_response, request)
+
+    assert resp["stop_reason"] == "tool_use"
+    tool_uses = [b for b in resp["content"] if b.get("type") == "tool_use"]
+    assert tool_uses[0]["name"] == "Write"
+    assert tool_uses[0]["input"]["file_path"] == "/tmp/a.kt"
+    assert _SECTION_BEGIN not in json.dumps(resp["content"])
+    texts = [b for b in resp["content"] if b.get("type") == "text"]
+    assert any("Writing the file now" in b["text"] for b in texts)
+    # The bare id and args JSON must not survive as visible text either.
+    assert not any("chatcmpl-tool-" in b["text"] for b in texts)

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Proxy Model Picker</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        max-width: 640px; margin: 32px auto; padding: 0 20px;
+        background: #100f0f; color: #cecdc3;
+      }
+      h1 { font-size: 18px; margin: 0 0 4px; color: #9cee02; }
+      .sub { color: #878577; margin-bottom: 20px; }
+      .session { font-family: ui-monospace, monospace; color: #4385be; }
+      ul { list-style: none; padding: 0; margin: 0 0 20px; }
+      li { padding: 8px 12px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 10px; }
+      li:hover { background: #1c1b1a; }
+      li.current { color: #9cee02; }
+      li.current .mark { color: #9cee02; }
+      .mark { width: 14px; display: inline-block; color: #575653; }
+      input[type="text"] {
+        width: 100%; box-sizing: border-box; padding: 9px 10px; margin-bottom: 16px;
+        background: #1c1b1a; color: #cecdc3; border: 1px solid #343330; border-radius: 6px;
+      }
+      button {
+        padding: 9px 16px; border: none; border-radius: 6px; cursor: pointer;
+        background: #9cee02; color: #100f0f; font-weight: 600;
+      }
+      button:disabled { background: #343330; color: #878577; cursor: not-allowed; }
+      .status { margin-left: 12px; font-size: 13px; }
+      .ok { color: #9cee02; } .err { color: #d14d41; }
+    </style>
+  </head>
+  <body>
+    <h1>Model Picker</h1>
+    <div class="sub">Session <span class="session" id="session"></span> — choose a backend model for the next turn.</div>
+    <input type="text" id="filter" placeholder="Filter models…" />
+    <ul id="list"></ul>
+    <button id="apply" disabled>Apply</button>
+    <span class="status" id="status"></span>
+
+    <script>
+      const params = new URLSearchParams(location.search);
+      const session = params.get("session") || "";
+      const $session = document.getElementById("session");
+      const $list = document.getElementById("list");
+      const $apply = document.getElementById("apply");
+      const $status = document.getElementById("status");
+      const $filter = document.getElementById("filter");
+      $session.textContent = session;
+
+      let all = [];
+      let current = null;
+      let selected = null;
+
+      async function load() {
+        $status.textContent = "loading…";
+        try {
+          const [modelsResp, curResp] = await Promise.all([
+            fetch("/v1/upstream-models").then(r => r.json()),
+            fetch("/v1/session-model?session=" + encodeURIComponent(session)).then(r => r.json()),
+          ]);
+          all = (modelsResp && modelsResp.data) || [];
+          current = (curResp && curResp.model) || (all[0] || "");
+          selected = current;
+          render();
+          if (!all.length) {
+            $status.innerHTML = '<span class="err">no models available</span>';
+            $apply.disabled = true;
+          } else {
+            $status.textContent = "";
+          }
+        } catch (e) {
+          $status.innerHTML = '<span class="err">failed to load: ' + e + "</span>";
+        }
+      }
+
+      function render() {
+        const q = $filter.value.trim().toLowerCase();
+        $list.innerHTML = "";
+        for (const m of all) {
+          if (q && !m.toLowerCase().includes(q)) continue;
+          const li = document.createElement("li");
+          if (m === selected) li.classList.add("current");
+          const mark = document.createElement("span");
+          mark.className = "mark";
+          mark.textContent = m === selected ? "●" : "○";
+          const label = document.createElement("span");
+          label.textContent = m;
+          if (m === current) {
+            const tag = document.createElement("span");
+            tag.textContent = "(current)";
+            tag.style.color = "#575653";
+            tag.style.marginLeft = "6px";
+            label.appendChild(tag);
+          }
+          li.appendChild(mark);
+          li.appendChild(label);
+          li.onclick = () => { selected = m; render(); $apply.disabled = false; };
+          $list.appendChild(li);
+        }
+        $apply.disabled = selected === current || !selected;
+      }
+
+      $apply.onclick = async () => {
+        if (!selected || selected === current) return;
+        $apply.disabled = true;
+        $status.textContent = "applying…";
+        try {
+          const resp = await fetch("/v1/session-model", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session, model: selected }),
+          });
+          if (!resp.ok) {
+            const err = await resp.text();
+            $status.innerHTML = '<span class="err">' + err + "</span>";
+            return;
+          }
+          current = selected;
+          render();
+          $status.innerHTML = '<span class="ok">done — next turn uses ' + selected + "</span>";
+        } catch (e) {
+          $status.innerHTML = '<span class="err">' + e + "</span>";
+        }
+      };
+
+      $filter.oninput = render;
+      load();
+    </script>
+  </body>
+</html>

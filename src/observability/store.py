@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from src.core.config import config
+from src.core.model_catalog import model_catalog
 from src.observability.pricing import PricingCatalog
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ class ObservabilityRecorder:
         error_type: Optional[str] = None,
         error_message: Optional[str] = None,
         tool_calls: Optional[List[Dict[str, Any]]] = None,
+        langfuse_trace_id: Optional[str] = None,
     ) -> None:
         if not self.enabled or self._queue is None:
             return
@@ -137,6 +139,7 @@ class ObservabilityRecorder:
                 "error_type": _truncate(error_type, 120),
                 "error_message": _truncate(error_message, 1000),
                 "tool_call_count": len(tool_calls),
+                "langfuse_trace_id": langfuse_trace_id,
             },
             "tool_calls": [
                 {
@@ -689,7 +692,8 @@ class ObservabilityRecorder:
                     error_message TEXT,
                     tool_call_count INTEGER NOT NULL DEFAULT 0,
                     session_id TEXT,
-                    session_name TEXT
+                    session_name TEXT,
+                    langfuse_trace_id TEXT
                 )
                 """)
             self._ensure_column(
@@ -708,6 +712,12 @@ class ObservabilityRecorder:
                 conn,
                 "requests",
                 "session_name",
+                "TEXT",
+            )
+            self._ensure_column(
+                conn,
+                "requests",
+                "langfuse_trace_id",
                 "TEXT",
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id)")
@@ -797,7 +807,7 @@ class ObservabilityRecorder:
                         cache_creation_input_tokens, cache_read_input_tokens, usage_source, total_tokens,
                         input_cost, output_cost, estimated_cost, currency,
                         advertised_tok_s, observed_tok_s, error_type, error_message,
-                        tool_call_count
+                        tool_call_count, langfuse_trace_id
                     ) VALUES (
                         :request_id, :session_id, :session_name, :started_at, :started_at_unix, :completed_at, :base_url,
                         :claude_model, :backend_model, :stream, :status, :http_status,
@@ -805,7 +815,7 @@ class ObservabilityRecorder:
                         :cache_creation_input_tokens, :cache_read_input_tokens, :usage_source, :total_tokens,
                         :input_cost, :output_cost, :estimated_cost, :currency,
                         :advertised_tok_s, :observed_tok_s, :error_type, :error_message,
-                        :tool_call_count
+                        :tool_call_count, :langfuse_trace_id
                     )
                     """,
                     request,
@@ -959,6 +969,6 @@ observability_recorder = ObservabilityRecorder(
     enabled=config.observability_enabled,
     db_path=config.observability_db_path,
     queue_size=config.observability_queue_size,
-    pricing_catalog=PricingCatalog(config.model_prices_json),
+    pricing_catalog=PricingCatalog(config.model_prices_json, dynamic=model_catalog),
     store_tool_args=config.observability_store_tool_args,
 )

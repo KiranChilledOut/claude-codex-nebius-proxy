@@ -23,17 +23,21 @@ class Config:
             "OPENAI_BASE_URL", "https://api.tokenfactory.nebius.com/v1"
         )
         self.azure_api_version = os.environ.get("AZURE_API_VERSION")  # For Azure OpenAI
-        self.host = os.environ.get("HOST", "0.0.0.0")
+        # Bind loopback by default: this proxy serves a local client (Claude
+        # Code / Codex on the same machine) and ignores client auth, so binding
+        # 0.0.0.0 would expose the inference endpoint to the whole LAN. Set
+        # HOST=0.0.0.0 explicitly to opt back into network serving.
+        self.host = os.environ.get("HOST", "127.0.0.1")
         self.port = int(os.environ.get("PORT", "8083"))
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
         self.max_tokens_limit = int(os.environ.get("MAX_TOKENS_LIMIT", "4096"))
         self.min_tokens_limit = int(os.environ.get("MIN_TOKENS_LIMIT", "100"))
-        # Optional explicit model context limits (tokens). If not set, code falls back to baked-in defaults.
-        self.big_model_context_limit = int(os.environ.get("BIG_MODEL_CONTEXT_LIMIT", "0") or 0)
-        self.middle_model_context_limit = int(
-            os.environ.get("MIDDLE_MODEL_CONTEXT_LIMIT", "0") or 0
-        )
-        self.small_model_context_limit = int(os.environ.get("SMALL_MODEL_CONTEXT_LIMIT", "0") or 0)
+        # Optional explicit model context limit (tokens). One value for the unified
+        # model; vision keeps its own. 0 = fall back to baked-in defaults in code.
+        self.model_context_limit = int(os.environ.get("MODEL_CONTEXT_LIMIT", "0") or 0)
+        self.big_model_context_limit = self.model_context_limit
+        self.middle_model_context_limit = self.model_context_limit
+        self.small_model_context_limit = self.model_context_limit
         self.vision_model_context_limit = int(
             os.environ.get("VISION_MODEL_CONTEXT_LIMIT", "0") or 0
         )
@@ -41,6 +45,15 @@ class Config:
         # Connection settings
         self.request_timeout = int(os.environ.get("REQUEST_TIMEOUT", "90"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "2"))
+        # Mid-stream idle watchdog: max seconds to await the next upstream
+        # chunk once a stream has started. REQUEST_TIMEOUT only covers stream
+        # setup; a hung Nebius stream otherwise goes silent but never errors.
+        self.stream_idle_timeout = int(os.environ.get("STREAM_IDLE_TIMEOUT", "120"))
+        # Max accepted request body size (bytes) -> 413 when exceeded.
+        # Guards uvicorn against buffering arbitrarily large client bodies.
+        self.max_request_body_bytes = int(
+            os.environ.get("MAX_REQUEST_BODY_BYTES", str(8 * 1024 * 1024))
+        )
 
         # Observability settings. The dashboard stores metadata only by default:
         # model routing, usage, cost estimates, latency, failures, and tool names.
@@ -58,11 +71,38 @@ class Config:
         ).lower() in ("1", "true", "yes")
         self.model_prices_json = os.environ.get("MODEL_PRICES_JSON", "{}")
 
-        # Model settings - BIG and SMALL models
-        self.big_model = os.environ.get("BIG_MODEL", "zai-org/GLM-4.5")
-        self.middle_model = os.environ.get("MIDDLE_MODEL", self.big_model)
-        self.small_model = os.environ.get("SMALL_MODEL", "zai-org/GLM-4.5")
+        # Langfuse observability: prompt/response tracing + training-data
+        # capture. When true, the /v1/messages and /v1/responses handlers emit
+        # a Langfuse trace + generation per request (full input/output/usage).
+        # See src/langfuse_integration/. Defaults off; enable in .env.
+        self.langfuse_enabled = os.environ.get("LANGFUSE_ENABLED", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+        # Model settings - one backend model for all Claude tiers; vision separate.
+        self.model = os.environ.get("MODEL", "zai-org/GLM-4.5")
+        # Legacy tier names kept as aliases so existing references keep working.
+        self.big_model = self.model
+        self.middle_model = self.model
+        self.small_model = self.model
         self.vision_model = os.environ.get("VISION_MODEL", "Qwen/Qwen2.5-VL-72B-Instruct")
+
+        # Dynamic model catalog (GET /v1/models?verbose=true) — primary source
+        # for pricing/context/listing. MODEL_PRICES_JSON acts as an override.
+        self.model_catalog_enabled = os.environ.get(
+            "MODEL_CATALOG_ENABLED", "true"
+        ).lower() in ("1", "true", "yes")
+        try:
+            self.model_catalog_refresh_seconds = int(
+                os.environ.get("MODEL_CATALOG_REFRESH_SECONDS", "3600") or 3600
+            )
+        except ValueError:
+            self.model_catalog_refresh_seconds = 3600
+        # Guard against a busy-loop from a 0/negative interval.
+        if self.model_catalog_refresh_seconds <= 0:
+            self.model_catalog_refresh_seconds = 3600
 
         # Force how thinking text is returned, overriding the client `display`
         # and the per-mode default. "" = honor the request (adaptive->omitted,

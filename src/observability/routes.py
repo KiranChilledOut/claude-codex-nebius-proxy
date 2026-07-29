@@ -1,13 +1,15 @@
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 
 from src.conversion.request_converter import _get_context_limit
 from src.core.config import config
 from src.core.model_manager import model_manager
+from src.core.session_settings import resolve_session_settings
 from src.ensemble.approval import approval_store
+from src.langfuse_integration import get_langfuse_client
 from src.observability.store import observability_recorder
 
 router = APIRouter()
@@ -57,6 +59,15 @@ async def dashboard_asset(asset_name: str, _: None = Depends(validate_dashboard_
 async def dashboard_health(_: None = Depends(validate_dashboard_api_key)):
     """Quick endpoint for checking dashboard availability (useful for load balancers / Uptime Kuma)."""
     return {"status": "ok", "version": "1.0"}
+
+
+@router.get("/dashboard/pick")
+async def dashboard_pick(
+    session: str = Query(..., min_length=1), _: None = Depends(validate_dashboard_api_key)
+):
+    """Standalone per-session model picker launched from the status line."""
+    html = (STATIC_DIR / "pick.html").read_text(encoding="utf-8")
+    return Response(content=html, media_type="text/html; charset=utf-8")
 
 
 @router.get("/api/observability/summary")
@@ -136,9 +147,14 @@ async def observability_tool_calls(
 
 
 @router.get("/api/observability/config")
-async def observability_config(_: None = Depends(validate_dashboard_api_key)):
+async def observability_config(request: Request, _: None = Depends(validate_dashboard_api_key)):
+    # Read from the Langfuse client's config singleton so `enabled`/`host`/
+    # `project_id` reflect exactly what traces are written with (the client
+    # never inits the SDK here — this is a cheap env read, no network).
+    _langfuse_config = get_langfuse_client().config
     return {
         "base_url": config.openai_base_url,
+        "effective_model": resolve_session_settings(request.headers).model,
         "configured_models": {
             "big": config.big_model,
             "middle": config.middle_model,
@@ -160,6 +176,12 @@ async def observability_config(_: None = Depends(validate_dashboard_api_key)):
             "sonnet": model_manager.config.middle_model,
             "opus": model_manager.config.big_model,
             "image": model_manager.config.vision_model,
+        },
+        "langfuse": {
+            "enabled": _langfuse_config.enabled,
+            "configured": _langfuse_config.is_configured(),
+            "host": _langfuse_config.host,
+            "project_id": _langfuse_config.project_id,
         },
     }
 

@@ -21,8 +21,7 @@ The proxy maps Codex model names to your actual backend:
 
 | Codex requests | Proxy serves                   |
 |----------------|--------------------------------|
-| `gpt-*`, `o1-*`, `o3-*` | `BIG_MODEL` (e.g., `moonshotai/Kimi-K2.6`) |
-| Any "mini" variant        | `SMALL_MODEL`                  |
+| `gpt-*`, `o1-*`, `o3-*`, any "mini" variant | `MODEL` (e.g., `moonshotai/Kimi-K2.6`) |
 
 > Note: The Codex CLI shows the model name it sent (`gpt-5.5`), not the backend model the proxy is serving. Use the proxy dashboard `http://localhost:8083/dashboard` to see the real model.
 

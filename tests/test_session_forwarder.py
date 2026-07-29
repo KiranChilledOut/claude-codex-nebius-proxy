@@ -119,3 +119,34 @@ def test_conn_closed_on_network_error():
             Forwarder._forward(handler, "POST")
 
         mock_conn.close.assert_called_once()
+
+
+def test_forward_injects_session_headers():
+    handler = _make_handler()
+    handler.requestline = "POST /v1/messages HTTP/1.1"
+    handler.request_version = "HTTP/1.1"
+    handler.protocol_version = "HTTP/1.1"
+    handler.command = "POST"
+    Forwarder.session = "sess-1"
+    Forwarder.model = "a/m"
+    Forwarder.ensemble_mode = "hedge"
+    Forwarder.ensemble_models = "a/m1,a/m2"
+    Forwarder.ensemble_judge = "a/judge"
+
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.reason = "OK"
+    mock_resp.getheaders.return_value = []
+    mock_resp.read.side_effect = [b""]
+    with patch("http.client.HTTPConnection") as MockConn:
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_resp
+        MockConn.return_value = mock_conn
+        Forwarder._forward(handler, "POST")
+        sent_headers = mock_conn.request.call_args.kwargs["headers"]
+
+    assert sent_headers["x-session-name"] == "sess-1"
+    assert sent_headers["x-session-model"] == "a/m"
+    assert sent_headers["x-session-ensemble-mode"] == "hedge"
+    assert sent_headers["x-session-ensemble-models"] == "a/m1,a/m2"
+    assert sent_headers["x-session-ensemble-judge"] == "a/judge"

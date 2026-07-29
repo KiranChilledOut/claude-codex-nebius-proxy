@@ -34,3 +34,36 @@ def test_image_routes_to_vision_model():
         model_manager.map_claude_model_to_openai("claude-3-sonnet", [image_message])
         == config.vision_model
     )
+
+
+def test_model_override_applies_to_text_but_not_images():
+    model_manager = ModelManager(config)
+    text_message = ClaudeMessage(role="user", content="Hello")
+    image_message = ClaudeMessage(
+        role="user",
+        content=[
+            ClaudeContentBlockText(type="text", text="describe"),
+            ClaudeContentBlockImage(
+                type="image",
+                source={
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
+                },
+            ),
+        ],
+    )
+    # override wins for text
+    assert (
+        model_manager.map_claude_model_to_openai(
+            "claude-3-sonnet", [text_message], model_override="x/custom"
+        )
+        == "x/custom"
+    )
+    # vision still wins over override for image-bearing turns
+    assert (
+        model_manager.map_claude_model_to_openai(
+            "claude-3-sonnet", [image_message], model_override="x/custom"
+        )
+        == config.vision_model
+    )

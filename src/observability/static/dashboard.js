@@ -67,6 +67,27 @@ async function fetchJson(url, options = {}) {
   return response.json();
 }
 
+// Langfuse trace deep-link state. Populated from /api/observability/config on
+// refresh(). When disabled, host missing, or project id unset, no link renders.
+let langfuseState = { enabled: false, host: "", projectId: "" };
+
+function langfuseTraceUrl(traceId) {
+  // Langfuse v4 trace URLs carry a project id in the path:
+  // {host}/project/{projectId}/traces/{traceId}. Without it the URL 404s, so
+  // return "" (caller renders an empty cell, not a broken link).
+  if (!langfuseState.enabled || !langfuseState.host || !langfuseState.projectId || !traceId) {
+    return "";
+  }
+  const base = langfuseState.host.replace(/\/+$/, "");
+  return `${base}/project/${encodeURIComponent(langfuseState.projectId)}/traces/${encodeURIComponent(traceId)}`;
+}
+
+function renderLangfuseTraceLink(traceId) {
+  const url = langfuseTraceUrl(traceId);
+  if (!url) return "";
+  return `<a class="pill" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="Open trace in Langfuse">trace ↗</a>`;
+}
+
 // ============================================
 // ThemeManager: handles dark/light mode
 // ============================================
@@ -793,6 +814,13 @@ const tableConfigs = {
         value: (row) => Number(row.tool_call_count || 0),
         render: (row) => fmtInt(row.tool_call_count),
       },
+      {
+        id: "langfuse_trace",
+        label: "Trace",
+        type: "text",
+        value: (row) => row.langfuse_trace_id || "",
+        render: (row) => renderLangfuseTraceLink(row.langfuse_trace_id),
+      },
     ],
   },
   failures: {
@@ -937,6 +965,13 @@ const tableConfigs = {
         type: "number",
         value: (row) => Number(row.tool_call_count || 0),
         render: (row) => fmtInt(row.tool_call_count),
+      },
+      {
+        id: "langfuse_trace",
+        label: "Trace",
+        type: "text",
+        value: (row) => row.langfuse_trace_id || "",
+        render: (row) => renderLangfuseTraceLink(row.langfuse_trace_id),
       },
     ],
   },
@@ -1421,18 +1456,25 @@ class DashboardApp {
       do {
         this.state.refreshQueued = false;
         const hours = el("windowSelect")?.value || "24";
-        const [summary, requests, failures, toolCalls, leaderboard] = await Promise.all([
+        const [summary, requests, failures, toolCalls, leaderboard, lfConfig] = await Promise.all([
           fetchJson(`/api/observability/summary?hours=${hours}`),
           fetchJson("/api/observability/requests?limit=500"),
           fetchJson("/api/observability/failures?limit=500"),
           fetchJson("/api/observability/tool-calls?limit=500"),
           fetchJson(`/api/observability/ensemble/leaderboard?hours=${hours}`).catch(() => ({ leaderboard: [] })),
+          fetchJson("/api/observability/config").catch(() => null),
         ]);
         this.state.summary = summary;
         this.state.requests = requests.data || [];
         this.state.failures = failures.data || [];
         this.state.toolCalls = toolCalls.data || [];
         this.state.ensembleLeaderboard = leaderboard.leaderboard || [];
+        const lf = lfConfig?.langfuse || {};
+        langfuseState = {
+          enabled: Boolean(lf.enabled),
+          host: String(lf.host || ""),
+          projectId: String(lf.project_id || ""),
+        };
         this.render();
 
         // Announce refresh to screen readers

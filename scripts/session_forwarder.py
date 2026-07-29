@@ -18,6 +18,10 @@ class Forwarder(http.server.BaseHTTPRequestHandler):
 
     target = ""
     session = ""
+    model = ""
+    ensemble_mode = ""
+    ensemble_models = ""
+    ensemble_judge = ""
 
     def log_message(self, fmt, *args):
         # Suppress default access logging to avoid noise
@@ -44,6 +48,14 @@ class Forwarder(http.server.BaseHTTPRequestHandler):
         # Build headers, inject x-session-name
         headers = dict(self.headers)
         headers["x-session-name"] = self.session
+        if self.model:
+            headers["x-session-model"] = self.model
+        if self.ensemble_mode:
+            headers["x-session-ensemble-mode"] = self.ensemble_mode
+        if self.ensemble_models:
+            headers["x-session-ensemble-models"] = self.ensemble_models
+        if self.ensemble_judge:
+            headers["x-session-ensemble-judge"] = self.ensemble_judge
         headers["X-Forwarded-For"] = forwarded_for
         headers["Host"] = f"{host}:{port}"
 
@@ -139,21 +151,27 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    if len(sys.argv) != 4:
-        print(
-            "Usage: session_forwarder.py <port> <target_host:port> <session_name>", file=sys.stderr
-        )
-        sys.exit(1)
+    import argparse
 
-    port = int(sys.argv[1])
-    target = sys.argv[2]
-    session_name = sys.argv[3]
+    parser = argparse.ArgumentParser(description="Per-session header-injecting forwarder")
+    parser.add_argument("port", type=int)
+    parser.add_argument("target")
+    parser.add_argument("session_name")
+    parser.add_argument("--model", default="")
+    parser.add_argument("--ensemble-mode", default="")
+    parser.add_argument("--ensemble-models", default="")
+    parser.add_argument("--ensemble-judge", default="")
+    args = parser.parse_args()
 
-    Forwarder.target = target
-    Forwarder.session = session_name
+    Forwarder.target = args.target
+    Forwarder.session = args.session_name
+    Forwarder.model = args.model
+    Forwarder.ensemble_mode = args.ensemble_mode
+    Forwarder.ensemble_models = args.ensemble_models
+    Forwarder.ensemble_judge = args.ensemble_judge
 
-    server = ThreadedHTTPServer(("127.0.0.1", port), Forwarder)
-    print(f"[forwarder] {session_name} -> {target} (port {port})", flush=True)
+    server = ThreadedHTTPServer(("127.0.0.1", args.port), Forwarder)
+    print(f"[forwarder] {args.session_name} -> {args.target} (port {args.port})", flush=True)
 
     try:
         server.serve_forever()

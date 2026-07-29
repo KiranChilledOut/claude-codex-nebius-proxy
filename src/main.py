@@ -1,4 +1,6 @@
+import asyncio
 import json
+import os
 import sys
 
 import uvicorn
@@ -14,28 +16,70 @@ from src.observability.store import observability_recorder
 
 app = FastAPI(title="Claude-to-OpenAI API Proxy", version="1.0.0")
 
+_catalog_refresh_task = None
+
 app.include_router(api_router)
 app.include_router(observability_router)
 
 
+@app.middleware("http")
+async def limit_request_body_size(request: Request, call_next):
+    """Reject oversized request bodies with 413 before parsing.
+
+    Uvicorn otherwise buffers arbitrarily large client bodies. A declared
+    Content-Length over the cap is rejected immediately; chunked bodies are
+    capped as they stream.
+    """
+    limit = config.max_request_body_bytes
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > limit:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "request_too_large",
+                            "message": f"Request body exceeds {limit} bytes",
+                        },
+                    },
+                )
+        except ValueError:
+            pass
+    else:
+        # No declared length (chunked/streamed): count while reading.
+        body = await request.body()
+        if len(body) > limit:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "request_too_large",
+                        "message": f"Request body exceeds {limit} bytes",
+                    },
+                },
+            )
+        # Re-inject the consumed body so downstream handlers can read it.
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request(request.scope, receive)
+    return await call_next(request)
+
+
 @app.exception_handler(RequestValidationError)
 async def log_validation_error(request: Request, exc: RequestValidationError):
-    """Log 422 validation errors with the offending request body for debugging."""
-    body = await request.body()
+    """Log 422 validation errors. Body content is NOT printed — request
+    bodies carry full prompts, which must not leak into logs. Only the path
+    and the (metadata-only) validation errors are recorded."""
     print("=== 422 validation error ===", flush=True)
     print("path:", request.url.path, flush=True)
     try:
         print("errors:", json.dumps(exc.errors(), default=str, indent=2)[:4000], flush=True)
     except Exception as e:
         print("errors (repr):", repr(exc.errors())[:4000], flush=True)
-    try:
-        parsed = json.loads(body)
-        if isinstance(parsed, dict) and "messages" in parsed and isinstance(parsed["messages"], list):
-            parsed["_messages_total"] = len(parsed["messages"])
-            parsed["messages"] = parsed["messages"][-3:]
-        print("body (tail):", json.dumps(parsed, default=str, indent=2)[:6000], flush=True)
-    except Exception:
-        print("body (raw):", body[:4000], flush=True)
     print("=== end 422 ===", flush=True)
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
@@ -43,11 +87,51 @@ async def log_validation_error(request: Request, exc: RequestValidationError):
 @app.on_event("startup")
 async def startup_event():
     await observability_recorder.start()
+    # Prime the model catalog (pricing/context/listing) before serving, then
+    # refresh on a timer. Never crash if the provider is unreachable.
+    from src.core.model_catalog import model_catalog
+
+    if config.model_catalog_enabled:
+        ok = await asyncio.to_thread(model_catalog.refresh)
+        print(
+            f"   Model catalog: {'loaded ' + str(len(model_catalog.model_ids())) + ' models' if ok else 'unavailable (using MODEL_PRICES_JSON fallback)'}",
+            flush=True,
+        )
+
+        async def _refresh_loop():
+            while True:
+                await asyncio.sleep(config.model_catalog_refresh_seconds)
+                await asyncio.to_thread(model_catalog.refresh)
+
+        global _catalog_refresh_task
+        _catalog_refresh_task = asyncio.create_task(_refresh_loop())
+    # Initialise the Langfuse client eagerly if enabled, so the first request
+    # doesn't pay the SDK warm-up cost. No-op when disabled/unconfigured.
+    try:
+        from src.langfuse_integration.client import get_langfuse_client
+
+        lf = get_langfuse_client()
+        lf._ensure_client()  # noqa: SLF001 — trigger lazy init
+        if lf._client is not None:  # noqa: SLF001
+            print(f"   Langfuse: enabled ({lf.config.host})", flush=True)
+    except Exception as exc:
+        print(f"   Langfuse: init failed — {exc}", flush=True)
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global _catalog_refresh_task
+    if _catalog_refresh_task is not None:
+        _catalog_refresh_task.cancel()
+        _catalog_refresh_task = None
     await observability_recorder.stop()
+    # Flush + tear down Langfuse background workers so queued traces aren't lost.
+    try:
+        from src.langfuse_integration.client import get_langfuse_client
+
+        get_langfuse_client().shutdown()
+    except Exception:
+        pass
 
 
 def main():
@@ -70,9 +154,7 @@ def main():
         print(
             f"  OPENAI_BASE_URL - OpenAI-compatible API base URL (default: {config.openai_base_url})"
         )
-        print(f"  BIG_MODEL - Model for opus requests (default: {config.big_model})")
-        print(f"  MIDDLE_MODEL - Model for sonnet requests (default: {config.middle_model})")
-        print(f"  SMALL_MODEL - Model for haiku requests (default: {config.small_model})")
+        print(f"  MODEL - Backend model for all Claude tiers (default: {config.model})")
         print(f"  VISION_MODEL - Model for image requests (default: {config.vision_model})")
         print(f"  HOST - Server host (default: {config.host})")
         print(f"  PORT - Server port (default: {config.port})")
@@ -153,6 +235,14 @@ def main():
     print(
         f"   Observability: {'Enabled' if config.observability_enabled else 'Disabled'} "
         f"({config.observability_db_path})"
+    )
+    langfuse_host = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
+    langfuse_keys = bool(
+        os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")
+    )
+    print(
+        f"   Langfuse: {'Enabled' if config.langfuse_enabled else 'Disabled'} "
+        f"(host={langfuse_host}, keys={'configured' if langfuse_keys else 'unconfigured'})"
     )
     print(
         "   Request Optimizations: "

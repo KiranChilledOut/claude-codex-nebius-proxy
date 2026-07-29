@@ -39,6 +39,7 @@ from .utils import (
     get_codex_config_path,
     get_repo_root,
     pick_default_models,
+    reinstall_shell_function,
     safe_merge_settings,
     shell_function_is_present,
     write_codex_config,
@@ -439,14 +440,14 @@ class ModelScreen(Screen):
     _env_defaults: dict[str, str] = {}
 
     def _load_env_models(self) -> dict[str, str]:
-        """Read existing BIG_MODEL etc. from .env if present."""
+        """Read existing MODEL/VISION_MODEL from .env if present."""
         env_path = get_repo_root() / ".env"
         d: dict[str, str] = {}
         if not env_path.is_file():
             return d
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            for key in ("BIG_MODEL", "MIDDLE_MODEL", "SMALL_MODEL", "VISION_MODEL"):
+            for key in ("MODEL", "VISION_MODEL"):
                 if line.startswith(f"{key}="):
                     val = line.split("=", 1)[1].strip("'\"")
                     if val:
@@ -456,7 +457,7 @@ class ModelScreen(Screen):
     def _pick_from_env(self, env_models: dict[str, str], available: list[str]) -> dict[str, str]:
         """Prefer .env values when they exist and are in available list."""
         defaults = pick_default_models(available)
-        for key in ("BIG_MODEL", "MIDDLE_MODEL", "SMALL_MODEL", "VISION_MODEL"):
+        for key in ("MODEL", "VISION_MODEL"):
             env_val = env_models.get(key)
             if env_val and env_val in available:
                 defaults[key] = env_val
@@ -494,6 +495,7 @@ class ModelScreen(Screen):
 
         models = result["models"]
         self.app.state.available_models = models
+        self.app.state.model_context_lengths = result.get("context_lengths", {})
         self.app.state.models_fetched = True
         self._defaults = self._pick_from_env(self._env_defaults, models)
         status.update(f"[green]✔  Found {len(models)} models[/]")
@@ -501,16 +503,14 @@ class ModelScreen(Screen):
             used = [v for k, v in self._env_defaults.items() if v in models]
             info.update(f"[rgb(0,188,212)]Loaded {len(used)} model(s) from existing .env[/]")
         else:
-            info.update(f"[dim]Using smart defaults: {self._defaults['BIG_MODEL']}[/dim]")
+            info.update(f"[dim]Using smart defaults: {self._defaults['MODEL']}[/dim]")
         self.query_one("#defaults", Button).disabled = False
         self.query_one("#next", Button).disabled = False
 
     @on(Button.Pressed)
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id in ("next", "defaults"):
-            self.app.state.big_model = self._defaults["BIG_MODEL"]
-            self.app.state.middle_model = self._defaults["MIDDLE_MODEL"]
-            self.app.state.small_model = self._defaults["SMALL_MODEL"]
+            self.app.state.model = self._defaults["MODEL"]
             self.app.state.vision_model = self._defaults["VISION_MODEL"]
             self.app.push_screen(ReviewScreen())
         elif event.button.id == "back":
@@ -524,9 +524,7 @@ class ReviewScreen(Screen):
     _initial_loaded: bool = False
 
     _LABELS: dict[str, str] = {
-        "big_model": "Big Model",
-        "middle_model": "Middle Model",
-        "small_model": "Small Model",
+        "model": "Model",
         "vision_model": "Vision Model",
     }
 
@@ -536,9 +534,7 @@ class ReviewScreen(Screen):
         if not models:
             return
         defaults: dict[str, str] = {
-            "big_model": self.app.state.big_model,
-            "middle_model": self.app.state.middle_model,
-            "small_model": self.app.state.small_model,
+            "model": self.app.state.model,
             "vision_model": self.app.state.vision_model,
         }
         opts = [(m, m) for m in models]
@@ -578,9 +574,7 @@ class ReviewScreen(Screen):
     @on(Button.Pressed)
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "confirm":
-            self.app.state.big_model = self.query_one("#big_model", Select).value
-            self.app.state.middle_model = self.query_one("#middle_model", Select).value
-            self.app.state.small_model = self.query_one("#small_model", Select).value
+            self.app.state.model = self.query_one("#model", Select).value
             self.app.state.vision_model = self.query_one("#vision_model", Select).value
             write_env(self.app.state)
             self.app.push_screen(SmokeScreen())
@@ -688,9 +682,15 @@ class ConfigurationScreen(Screen):
     STATUSLINE_CMD = (
         '[ -z "$ANTHROPIC_BASE_URL" ] && exit 0; '
         'base="${ANTHROPIC_BASE_URL%/}"; '
+        # Query the live per-session model via the forwarder (it injects
+        # x-session-name, so effective_model reflects any runtime override set
+        # from the dashboard picker). NEBIUS_SESSION_MODEL (the startup pick)
+        # is only a fallback when the proxy is unreachable — otherwise it would
+        # freeze the statusline on the startup model forever.
         'cfg=$(curl -fsS --max-time 1 "$base/api/observability/config" 2>/dev/null || true); '
         'model=$(printf \'%s\' "$cfg" | python3 -c \'import json,sys; d=json.load(sys.stdin); '
-        'print((d.get("configured_models") or {}).get("big") or "")\' 2>/dev/null || true); '
+        'print(d.get("effective_model") or (d.get("configured_models") or {}).get("big") or "")\' 2>/dev/null || true); '
+        '[ -z "$model" ] && model="${NEBIUS_SESSION_MODEL:-}"; '
         'ctx=$(curl -fsS --max-time 1 "$base/api/observability/context-usage" 2>/dev/null || true); '
         'free=$(printf \'%s\' "$ctx" | python3 -c \'import json,sys; d=json.load(sys.stdin); '
         'r=d.get("remaining_tokens",1048576) or 1048576; '
@@ -703,9 +703,11 @@ class ConfigurationScreen(Screen):
         'elif [ "$free" -le 50 ]; then c="\\\\033[33m"; '
         'else c="\\\\033[32m"; fi; '
         'e="\\\\033[0m"; '
-        'echo "[nebius://$model $c${free}% free$e] $base/dashboard"; '
-        'else echo "[nebius://$model] $base/dashboard"; fi; '
-        'else echo "[proxy://$base]"; fi'
+        'url="$base/dashboard/pick?session=${NEBIUS_SESSION_NAME:-}"; '
+        'printf "%b" "[nebius://\\033]8;;$url\\a$model\\033]8;;\\a $c${free}%% free$e] $base/dashboard\\n"; '
+        'else url="$base/dashboard/pick?session=${NEBIUS_SESSION_NAME:-}"; '
+        'printf "%b" "[nebius://\\033]8;;$url\\a$model\\033]8;;\\a] $base/dashboard\\n"; fi; '
+        'else printf "%b" "[proxy://$base]\\n"; fi'
     )
 
     def compose(self) -> ComposeResult:
@@ -737,6 +739,17 @@ class ConfigurationScreen(Screen):
 
             # ── Shell Shortcuts / Profiles ──
             yield Static("[bold rgb(0,188,212)]▐▛▜▌ Shell Shortcuts[/]", classes="section_header")
+            yield Checkbox(
+                "Reinstall (overwrite) existing shell functions",
+                value=False,
+                id="reinstall_shell",
+            )
+            yield Static(
+                "  [dim]When checked, already-configured profiles become selectable and get "
+                "refreshed (backed up first) instead of skipped.[/]",
+                classes="hint_label",
+                id="reinstall_hint",
+            )
             yield Static("Select profiles to add shortcuts:", classes="hint_label", id="profile_label")
             yield Static("", id="profile_status")
 
@@ -763,7 +776,7 @@ class ConfigurationScreen(Screen):
         codex_hint = self.query_one("#codex_hint", Static)
         codex_path = get_codex_config_path()
         if codex_path and codex_path.exists():
-            model = s.big_model
+            model = s.model
             if model:
                 provider_model = f"nebius/{model}" if not model.startswith("nebius/") else model
                 codex_hint.update(
@@ -775,7 +788,6 @@ class ConfigurationScreen(Screen):
         # ── Shell profiles ──
         from .utils import get_all_shell_profiles
 
-        profile_container = self.query_one("#config_content", Container)
         profile_label = self.query_one("#profile_label", Static)
         profile_status = self.query_one("#profile_status", Static)
 
@@ -785,33 +797,86 @@ class ConfigurationScreen(Screen):
             profile_label.update("[yellow]⚠ No shell profiles detected — install bash, zsh, or PowerShell[/]")
             profile_status.update("[dim]Skipping profile configuration.[/dim]")
         else:
-            # Clear the old hint and add checkboxes for each profile
             profile_label.update("Select profiles to add shortcuts:")
-            selected: list[tuple[ShellType, str]] = []
+            self._render_profile_checkboxes()
 
-            for idx, (stype, path) in enumerate(s.available_profiles):
-                # Check if functions already exist in this profile
-                already_has = shell_function_is_present(stype, path)
-                checkbox_id = f"profile_{idx}"
+    def _render_profile_checkboxes(self) -> None:
+        """Mount per-profile checkboxes once (called from on_mount).
 
-                if already_has:
-                    # Show as already configured, unchecked and disabled
-                    profile_container.mount(Checkbox(
-                        f"[dim]{path} (already configured)[/dim]",
-                        value=False,
-                        disabled=True,
-                        id=checkbox_id,
-                    ))
-                else:
-                    # Checked by default, user can uncheck
+        Fresh profiles are checked by default; already-configured ones start
+        disabled (skipped) and become selectable when the reinstall toggle is
+        flipped (handled by _refresh_profile_checkboxes, which mutates the
+        already-mounted widgets instead of re-mounting — Textual rejects
+        re-mounting a second widget with the same id).
+        """
+        s = self.app.state
+        profile_container = self.query_one("#config_content", Container)
+        profile_status = self.query_one("#profile_status", Static)
+
+        selected: list[tuple[ShellType, str]] = []
+        for idx, (stype, path) in enumerate(s.available_profiles):
+            already_has = shell_function_is_present(stype, path)
+            checkbox_id = f"profile_{idx}"
+            if already_has:
+                profile_container.mount(Checkbox(
+                    f"[dim]{path} (already configured)[/dim]",
+                    value=False,
+                    disabled=True,
+                    id=checkbox_id,
+                ))
+            else:
+                selected.append((stype, path))
+                profile_container.mount(Checkbox(
+                    path,
+                    value=True,
+                    id=checkbox_id,
+                ))
+
+        s.selected_profiles = selected
+        profile_status.update(f"[dim]Will add to {len(selected)} profile(s)[/dim]")
+
+    def _refresh_profile_checkboxes(self) -> None:
+        """Toggle already-configured profile checkboxes to match the reinstall flag.
+
+        Mutates the existing widgets (disabled/value/label) rather than
+        re-mounting, so no DuplicateIds collision. Fresh profiles are untouched.
+        """
+        s = self.app.state
+        profile_status = self.query_one("#profile_status", Static)
+        reinstall = s.reinstall_shell
+
+        selected: list[tuple[ShellType, str]] = []
+        for idx, (stype, path) in enumerate(s.available_profiles):
+            already_has = shell_function_is_present(stype, path)
+            try:
+                cb = self.query_one(f"#profile_{idx}", Checkbox)
+            except Exception:
+                continue
+            if not already_has:
+                if cb.value:
                     selected.append((stype, path))
-                    profile_container.mount(Checkbox(
-                        path,
-                        value=True,
-                        id=checkbox_id,
-                    ))
+                continue
+            # Already-configured profile: enable/disable per the toggle.
+            if reinstall:
+                cb.disabled = False
+                cb.label = f"{path} (reinstall)"
+                if cb.value:
+                    selected.append((stype, path))
+            else:
+                cb.disabled = True
+                cb.value = False
+                cb.label = f"{path} (already configured)"
 
-            s.selected_profiles = selected
+        s.selected_profiles = selected
+        if reinstall:
+            fresh = sum(1 for _, p in s.available_profiles
+                        if not shell_function_is_present(ShellType.UNKNOWN, p))
+            existing = len(s.available_profiles) - fresh
+            profile_status.update(
+                f"[dim]{fresh} new profile(s) to add, {existing} already-configured "
+                f"(check to reinstall) — select already-configured ones to overwrite[/dim]"
+            )
+        else:
             profile_status.update(f"[dim]Will add to {len(selected)} profile(s)[/dim]")
 
     @on(Checkbox.Changed)
@@ -822,6 +887,12 @@ class ConfigurationScreen(Screen):
             self.app.state.configure_claude = cb.value
         elif cb.id == "do_codex":
             self.app.state.configure_codex = cb.value
+        elif cb.id == "reinstall_shell":
+            self.app.state.reinstall_shell = cb.value
+            # Toggle already-configured profiles between disabled (skip) and
+            # selectable (reinstall). Mutates mounted widgets — no re-mounting.
+            if self.app.state.available_profiles:
+                self._refresh_profile_checkboxes()
         elif cb.id and cb.id.startswith("profile_"):
             # Recompute selected profiles from all profile_* checkboxes
             s = self.app.state
@@ -837,14 +908,15 @@ class ConfigurationScreen(Screen):
             profile_status = self.query_one("#profile_status", Static)
             count = len(selected)
             total = len(s.available_profiles)
+            verb = "reinstall" if s.reinstall_shell else "add to"
             if count == 0:
                 profile_status.update("[dim]No profiles selected[/dim]")
             else:
-                profile_status.update(f"[dim]Will add to {count}/{total} profile(s)[/dim]")
+                profile_status.update(f"[dim]Will {verb} {count}/{total} profile(s)[/dim]")
 
     def _write_codex(self) -> str:
         result = write_codex_config(
-            self.app.state.big_model,
+            self.app.state.model,
             self.app.state.port,
             get_repo_root(),
         )
@@ -896,11 +968,25 @@ class ConfigurationScreen(Screen):
             lines: list[str] = []
 
             # ── Shell profiles ──
+            added = 0
+            reinstalled = 0
+            skipped = 0
             for stype, path in s.selected_profiles:
-                append_shell_function(stype, path, s.port, get_repo_root())
-                lines.append(f"[green]✔  Added to {path}[/green]")
-            skipped = sum(1 for _, path in s.available_profiles
-                         if shell_function_is_present(ShellType.UNKNOWN, path)) if s.available_profiles else 0
+                already_has = shell_function_is_present(stype, path)
+                if already_has:
+                    # Only reachable when the user enabled reinstall and checked
+                    # an already-configured profile; refresh it in place.
+                    reinstall_shell_function(stype, path, s.port, get_repo_root())
+                    lines.append(f"[green]✔  Reinstalled {path}[/green]")
+                    reinstalled += 1
+                else:
+                    append_shell_function(stype, path, s.port, get_repo_root())
+                    lines.append(f"[green]✔  Added to {path}[/green]")
+                    added += 1
+            selected_set = set(s.selected_profiles)
+            skipped = sum(1 for st, path in s.available_profiles
+                         if shell_function_is_present(st, path)
+                         and (st, path) not in selected_set) if s.available_profiles else 0
             if skipped > 0:
                 lines.append(f"[dim]  Skipped {skipped} already-configured profile(s)[/dim]")
             if not s.selected_profiles and not skipped:

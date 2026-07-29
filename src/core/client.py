@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from fastapi import HTTPException
@@ -15,7 +16,18 @@ from openai._exceptions import (
     RateLimitError,
 )
 
+from src.core.config import config
+
 logger = logging.getLogger(__name__)
+
+
+class StreamIdleTimeoutError(Exception):
+    """No upstream chunk arrived within the configured idle window.
+
+    Distinct from setup timeouts: raised once the stream is established but
+    the provider has gone silent, so the client sees a typed, retryable error
+    instead of a stream that stalls forever.
+    """
 
 # Models that returned a 400 specifically because of `reasoning_effort`. Once a
 # model rejects it, we stop sending it (avoids repeating the failed call). This
@@ -160,6 +172,8 @@ class OpenAIClient:
                 api_key=api_key, base_url=base_url, timeout=timeout, default_headers=all_headers
             )
         self.active_requests: Dict[str, asyncio.Event] = {}
+        # Mid-stream idle watchdog (seconds). See config.stream_idle_timeout.
+        self.stream_idle_timeout = getattr(config, "stream_idle_timeout", 120)
 
     def _should_retry(self, error: Exception) -> bool:
         if isinstance(error, (RateLimitError, APIConnectionError, APITimeoutError)):
@@ -333,11 +347,53 @@ class OpenAIClient:
             if streaming_completion is None:
                 raise HTTPException(status_code=500, detail="Stream setup failed after retries")
 
-            async for chunk in streaming_completion:
-                # Check for cancellation before yielding each chunk
-                if request_id and request_id in self.active_requests:
-                    if self.active_requests[request_id].is_set():
-                        raise HTTPException(status_code=499, detail="Request cancelled by client")
+            # Mid-stream idle watchdog: REQUEST_TIMEOUT only bounds stream
+            # setup above. Wrap each chunk read in a deadline so a hung
+            # upstream surfaces as a typed error instead of a stream that
+            # goes silent forever (the "response just stops" symptom).
+            chunk_iter = streaming_completion.__aiter__()
+            while True:
+                try:
+                    next_chunk = asyncio.ensure_future(chunk_iter.__anext__())
+                    if request_id and request_id in self.active_requests:
+                        cancel_wait = asyncio.ensure_future(
+                            self.active_requests[request_id].wait()
+                        )
+                        done, pending = await asyncio.wait(
+                            {next_chunk, cancel_wait},
+                            timeout=self.stream_idle_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in pending:
+                            task.cancel()
+                        if not done:
+                            # Idle watchdog fired.
+                            raise StreamIdleTimeoutError(
+                                f"No upstream data for {self.stream_idle_timeout}s "
+                                "(stream idle timeout)"
+                            )
+                        if cancel_wait in done:
+                            raise HTTPException(
+                                status_code=499, detail="Request cancelled by client"
+                            )
+                        try:
+                            chunk = next_chunk.result()
+                        except StopAsyncIteration:
+                            break
+                    else:
+                        try:
+                            chunk = await asyncio.wait_for(
+                                next_chunk, timeout=self.stream_idle_timeout
+                            )
+                        except asyncio.TimeoutError:
+                            raise StreamIdleTimeoutError(
+                                f"No upstream data for {self.stream_idle_timeout}s "
+                                "(stream idle timeout)"
+                            )
+                        except StopAsyncIteration:
+                            break
+                except StreamIdleTimeoutError:
+                    raise
 
                 # Convert chunk to SSE format matching original HTTP client format
                 chunk_dict = chunk.model_dump()
@@ -346,6 +402,18 @@ class OpenAIClient:
 
             # Signal end of stream
             yield "data: [DONE]"
+        except StreamIdleTimeoutError:
+            logger.warning(
+                "Upstream stream idle for >%ss; surfacing retryable error.",
+                self.stream_idle_timeout,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Upstream stopped sending data for {self.stream_idle_timeout}s; "
+                    "retry the request."
+                ),
+            )
         except HTTPException:
             raise
         except Exception as e:
@@ -377,7 +445,7 @@ class OpenAIClient:
 
         # Model not found
         if "model" in error_str and ("not found" in error_str or "does not exist" in error_str):
-            return "Model not found. Please check your BIG_MODEL and SMALL_MODEL configuration."
+            return "Model not found. Please check your MODEL and VISION_MODEL configuration."
 
         # Billing issues
         if "billing" in error_str or "payment" in error_str:
@@ -393,16 +461,42 @@ class OpenAIClient:
         # Default: return original message
         return str(error_detail)
 
+    @staticmethod
+    def _redact_body(body: Any, limit: int = 800) -> str:
+        """Summarize an error body for logs without leaking prompt content.
+
+        Token Factory error bodies can echo back request fields (including
+        message text), so we log a truncated, secret-scrubbed form rather
+        than the full payload.
+        """
+        try:
+            if isinstance(body, (dict, list)):
+                text = json.dumps(body, ensure_ascii=False)
+            else:
+                text = str(body)
+        except Exception:
+            text = "<unserializable>"
+        text = re.sub(
+            r"(sk-[A-Za-z0-9_\-]{6})[A-Za-z0-9_\-]+", r"\1…", text
+        )
+        if len(text) > limit:
+            text = text[:limit] + "…[truncated]"
+        return text
+
     def _log_openai_error(self, error: Exception) -> None:
+        status = getattr(error, "status_code", None)
         response = getattr(error, "response", None)
         if response is not None:
             try:
-                logger.error("OpenAI API error response body: %s", response.text)
+                body = self._redact_body(response.text)
+                logger.error(
+                    "OpenAI API error (status=%s) body: %s", status, body
+                )
             except Exception:
-                logger.error("OpenAI API error response body: <unreadable>")
+                logger.error("OpenAI API error (status=%s): <unreadable>", status)
         body = getattr(error, "body", None)
         if body:
-            logger.error("OpenAI API error body parsed: %s", body)
+            logger.error("OpenAI API error parsed: %s", self._redact_body(body))
 
     def list_models(self) -> list[dict]:
         """Fetch available models from the upstream provider's /v1/models endpoint.

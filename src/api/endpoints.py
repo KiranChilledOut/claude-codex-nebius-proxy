@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.codex.models import ResponsesItem, ResponsesRequest, ResponsesResponse, ResponsesUsage
@@ -35,10 +35,13 @@ from src.conversion.response_converter import (
     scale_usage_for_client,
 )
 from src.core.client import OpenAIClient
+from src.core.session_settings import resolve_session_settings
 from src.core.config import config
 from src.core.logging import logger
 from src.core.model_manager import model_manager
+from src.langfuse_integration.client import get_langfuse_client
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
+from src.core.model_catalog import model_catalog
 from src.observability.store import observability_recorder
 
 router = APIRouter()
@@ -132,6 +135,100 @@ def _stream_usage_with_fallback(stream_metrics: dict, estimated_input_tokens: in
     }
 
 
+def _langfuse_usage(usage: Optional[dict]) -> Optional[dict]:
+    """Shape a Claude/OpenAI-style usage dict for Langfuse's generation.update().
+
+    Langfuse accepts {"input": N, "output": N, "total": N}; the proxy's usage
+    carries input_tokens/output_tokens plus Anthropic cache variants, so input
+    folds in cache creation/read tokens (the full prompt the backend billed).
+    Returns None when there's no usage to report.
+    """
+    if not usage:
+        return None
+    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+    if not (input_tokens or output_tokens or cache_creation or cache_read):
+        return None
+    full_input = input_tokens + cache_creation + cache_read
+    return {
+        "input": full_input,
+        "output": output_tokens,
+        "total": full_input + output_tokens,
+    }
+
+
+def _langfuse_cost(
+    backend_model: Optional[str], usage: Optional[dict]
+) -> Optional[dict]:
+    """Quote a cost breakdown for Langfuse's generation cost_details.
+
+    Mirrors the SQLite recorder's pricing logic so both stores agree: input
+    folds in Anthropic cache tokens (the billed prompt size). Returns None
+    when pricing is unavailable for the model or usage is missing.
+    """
+    if not usage or not backend_model:
+        return None
+    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+    prompt_total = input_tokens + cache_creation + cache_read
+    if not (prompt_total or output_tokens):
+        return None
+    pricing = observability_recorder.pricing_catalog.quote(
+        backend_model, prompt_total, output_tokens
+    )
+    if pricing.get("estimated_cost") is None:
+        return None
+    return {
+        "input": pricing.get("input_cost") or 0.0,
+        "output": pricing.get("output_cost") or 0.0,
+        "total": pricing.get("estimated_cost") or 0.0,
+    }
+
+
+def _langfuse_active() -> bool:
+    """True only when Langfuse tracing is enabled AND configured with keys."""
+    client = get_langfuse_client()
+    return bool(client.config.enabled and client.config.is_configured())
+
+
+def _langfuse_start(*, request_id: str, name: str, user_id: Optional[str],
+                    metadata: dict, tags: list, model: Optional[str] = None,
+                    input_data: Any = None) -> tuple:
+    """Start a Langfuse trace + generation. Returns (trace_id, gen_id).
+
+    Returns (None, None) when Langfuse is inactive, so callers can guard
+    end_generation with a simple truthiness check.
+
+    Langfuse v4 requires trace ids in 32-char hex format (no hyphens).
+    The proxy's UUID request_id is canonicalized here.
+
+    ``model`` and ``input_data`` are optional; when the caller knows them
+    upfront they are attached to the single generation instead of requiring
+    a duplicate ``start_generation`` call later.
+    """
+    if not _langfuse_active():
+        return None, None
+    client = get_langfuse_client()
+    # Strip hyphens from uuid: '550e...-...' -> '550e...'
+    langfuse_trace_id = request_id.replace("-", "")
+    trace_id = client.start_trace(
+        id=langfuse_trace_id, name=name, user_id=user_id, metadata=metadata, tags=tags
+    )
+    gen_id = client.start_generation(
+        trace_id=trace_id,
+        name=name,
+        metadata=metadata,
+        model=model,
+        input_data=input_data,
+    )
+    return trace_id, gen_id
+
+
+
 def _record_message_observability(
     *,
     request_id: str,
@@ -150,6 +247,7 @@ def _record_message_observability(
     error_type: Optional[str] = None,
     error_message: Optional[str] = None,
     tool_calls: Optional[list] = None,
+    langfuse_trace_id: Optional[str] = None,
 ) -> None:
     observability_recorder.record_request(
         request_id=request_id,
@@ -170,6 +268,7 @@ def _record_message_observability(
         error_type=error_type,
         error_message=error_message,
         tool_calls=tool_calls,
+        langfuse_trace_id=langfuse_trace_id,
     )
 
 
@@ -226,6 +325,20 @@ async def create_response(
     started_at_unix = time.time()
     start_monotonic = time.monotonic()
     backend_model = None
+
+    # Langfuse trace — full prompt/response capture for training data
+    lf_trace_id, lf_gen_id = _langfuse_start(
+        request_id=request_id,
+        name="proxy-v1-responses",
+        user_id=None,
+        metadata={
+            "codex_model": request.model,
+            "stream": request.stream,
+            "has_tools": bool(request.tools),
+            "previous_response_id": request.previous_response_id,
+        },
+        tags=["proxy", "v1-responses"],
+    )
 
     # Session ID from request or headers
     session_id = None
@@ -311,7 +424,19 @@ async def create_response(
                 latency_ms=(time.monotonic() - start_monotonic) * 1000,
                 usage=usage_dict,
                 tool_calls=_extract_tool_calls_from_codex_output(codex_response.output),
+                langfuse_trace_id=lf_trace_id,
             )
+            if lf_trace_id and lf_gen_id:
+                get_langfuse_client().end_generation(
+                    generation_id=lf_gen_id,
+                    output_data=codex_response,
+                    usage=_langfuse_usage(usage_dict),
+                    cost=_langfuse_cost(backend_model, usage_dict),
+                    model=backend_model,
+                    input_data=openai_request.get("messages"),
+                    metadata={"backend_model": backend_model, "input_format": "codex"},
+                    status="success",
+                )
 
             # Save session (same logic as non-streaming path)
             if isinstance(request.input, list):
@@ -363,7 +488,19 @@ async def create_response(
                 latency_ms=(time.monotonic() - start_monotonic) * 1000,
                 usage=usage_dict,
                 tool_calls=_extract_tool_calls_from_codex_output(codex_response.output),
+                langfuse_trace_id=lf_trace_id,
             )
+            if lf_trace_id and lf_gen_id:
+                get_langfuse_client().end_generation(
+                    generation_id=lf_gen_id,
+                    output_data=codex_response,
+                    usage=_langfuse_usage(usage_dict),
+                    cost=_langfuse_cost(backend_model, usage_dict),
+                    model=backend_model,
+                    input_data=openai_request.get("messages"),
+                    metadata={"backend_model": backend_model, "input_format": "codex"},
+                    status="success",
+                )
 
             # Save session (non-streaming only)
             if isinstance(request.input, list):
@@ -430,7 +567,22 @@ async def create_response(
                     latency_ms=(time.monotonic() - start_monotonic) * 1000,
                     error_type=None if stream_status == "success" else type(stream_error).__name__,
                     error_message=stream_error,
+                    langfuse_trace_id=lf_trace_id,
                 )
+                # --- Langfuse: finish the generation in the streaming path ---
+                if lf_trace_id and lf_gen_id:
+                    stream_usage = accumulator.get("usage") if accumulator else None
+                    get_langfuse_client().end_generation(
+                        generation_id=lf_gen_id,
+                        output_data=accumulator if accumulator else {"status": stream_status},
+                        usage=_langfuse_usage(stream_usage),
+                        cost=_langfuse_cost(backend_model, stream_usage),
+                        model=backend_model,
+                        input_data=openai_request.get("messages"),
+                        metadata={"backend_model": backend_model, "input_format": "codex"},
+                        status=stream_status,
+                        error_message=stream_error,
+                    )
                 # Save session for next turn (same logic as non-streaming)
                 if accumulator.get("response_id"):
                     if isinstance(request.input, list):
@@ -498,7 +650,17 @@ async def create_response(
             latency_ms=(time.monotonic() - start_monotonic) * 1000,
             error_type=type(e).__name__,
             error_message=str(e),
+            langfuse_trace_id=lf_trace_id,
         )
+        if lf_trace_id and lf_gen_id:
+            get_langfuse_client().end_generation(
+                generation_id=lf_gen_id,
+                output_data=None,
+                usage=None,
+                model=backend_model,
+                status="error",
+                error_message=str(e),
+            )
         return error_response
 
 
@@ -511,6 +673,10 @@ async def create_message(
     started_at_unix = time.time()
     start_monotonic = time.monotonic()
     backend_model = None
+
+    # Langfuse trace setup (lazy — actual trace started when model is known)
+    lf_trace_id, lf_gen_id = None, None
+
     try:
         # Log anthropic-beta header if present (for computer use, etc.)
         beta_header = http_request.headers.get("anthropic-beta", "")
@@ -519,6 +685,7 @@ async def create_message(
 
         session_id = http_request.headers.get("x-claude-code-session-id")
         session_name = http_request.headers.get("x-session-name")
+        settings = resolve_session_settings(http_request.headers)
         if session_id:
             logger.debug(f"x-claude-code-session-id: {session_id}")
 
@@ -548,6 +715,7 @@ async def create_message(
                 usage=observability_usage,
                 stop_reason=optimized.response.get("stop_reason"),
                 tool_calls=[],
+                langfuse_trace_id=lf_trace_id,
             )
             if request.stream:
                 return StreamingResponse(
@@ -563,7 +731,9 @@ async def create_message(
             return optimized.response
 
         # Convert Claude request to OpenAI format
-        openai_request = convert_claude_to_openai(request, model_manager)
+        openai_request = convert_claude_to_openai(
+            request, model_manager, model_override=settings.model
+        )
         backend_model = openai_request.get("model")
         estimated_input_tokens = _estimate_prompt_tokens(
             openai_request.get("messages", []), include_safety_buffer=False
@@ -573,6 +743,27 @@ async def create_message(
         # backend's real window is filling (observability keeps raw tokens).
         usage_scale = compute_usage_scale(request.model, backend_model, beta_header)
 
+        # --- Start Langfuse trace now that model + context are known ---
+        lf_trace_id, lf_gen_id = _langfuse_start(
+            request_id=request_id,
+            name="proxy-v1-messages",
+            user_id=session_name or session_id,
+            metadata={
+                "claude_model": request.model,
+                "backend_model": backend_model,
+                "ensemble_mode": settings.ensemble_mode,
+                "stream": bool(request.stream),
+                "has_tools": bool(request.tools),
+                "session_id": session_id,
+                "session_name": session_name,
+                "estimated_input_tokens": estimated_input_tokens,
+                "usage_scale": usage_scale,
+            },
+            tags=["proxy", "v1-messages"],
+            model=backend_model,
+            input_data=openai_request.get("messages"),
+        )
+
         # Claude Code's main loop always offers WebSearch, so when Tavily is
         # configured nearly every real turn carries a search tool. The ensemble
         # racer must therefore take precedence and run the search loop per
@@ -580,8 +771,8 @@ async def create_message(
         # housekeeping probes.
         has_search_tool = server_tools.request_has_search_tool(request)
         ensemble_active = (
-            config.ensemble_mode in ("hedge", "approval")
-            and len(config.ensemble_models) >= 2
+            settings.ensemble_mode in ("hedge", "approval")
+            and len(settings.ensemble_models) >= 2
             and not model_manager.contains_image_content(
                 request.messages, latest_user_only=True
             )
@@ -612,7 +803,16 @@ async def create_message(
                 usage=claude_response.get("usage"),
                 stop_reason=claude_response.get("stop_reason"),
                 tool_calls=_extract_tool_calls_from_claude_response(claude_response),
+                langfuse_trace_id=lf_trace_id,
             )
+            if lf_trace_id and lf_gen_id:
+                get_langfuse_client().end_generation(
+                    generation_id=lf_gen_id,
+                    output_data=claude_response,
+                    usage=_langfuse_usage(claude_response.get("usage")),
+                    cost=_langfuse_cost(backend_model, claude_response.get("usage")),
+                    status="success",
+                )
             claude_response["usage"] = scale_usage_for_client(
                 claude_response.get("usage"), usage_scale
             )
@@ -646,10 +846,10 @@ async def create_message(
                 openai_request,
                 openai_client,
                 request_id,
-                config.ensemble_models,
-                config.ensemble_mode,
+                settings.ensemble_models,
+                settings.ensemble_mode,
                 runner=search_runner,
-                judge_model=config.ensemble_judge_model or None,
+                judge_model=settings.ensemble_judge,
             )
 
             def _finalize_race(chosen_by: str) -> dict:
@@ -674,14 +874,36 @@ async def create_message(
                     usage=claude_response.get("usage"),
                     stop_reason=claude_response.get("stop_reason"),
                     tool_calls=_extract_tool_calls_from_claude_response(claude_response),
+                    langfuse_trace_id=lf_trace_id,
                 )
                 observability_recorder.record_ensemble(
                     request_id=request_id,
                     session_id=session_id,
                     session_name=session_name,
-                    mode=config.ensemble_mode,
+                    mode=settings.ensemble_mode,
                     candidates=race.candidates,
                 )
+                if lf_trace_id and lf_gen_id:
+                    get_langfuse_client().end_generation(
+                        generation_id=lf_gen_id,
+                        output_data=claude_response,
+                        usage=_langfuse_usage(claude_response.get("usage")),
+                        cost=_langfuse_cost(
+                            backend_model, claude_response.get("usage")
+                        ),
+                        status="success",
+                    )
+                    # Tag the race: ensemble mode + how the winner was chosen
+                    get_langfuse_client().add_event_to_trace(
+                        trace_id=lf_trace_id,
+                        event_name="ensemble-race",
+                        metadata={
+                            "mode": settings.ensemble_mode,
+                            "chosen_by": chosen_by,
+                            "winner_model": race.winner.model,
+                            "candidate_count": len(race.candidates),
+                        },
+                    )
                 claude_response["usage"] = scale_usage_for_client(
                     claude_response.get("usage"), usage_scale
                 )
@@ -691,7 +913,7 @@ async def create_message(
             # (title generation, quota checks — tool-less, tiny max_tokens)
             # would otherwise stall Claude Code for the approval timeout.
             hold_for_approval = (
-                config.ensemble_mode == "approval"
+                settings.ensemble_mode == "approval"
                 and bool(request.stream)
                 and bool(request.tools)
                 and sum(1 for c in race.candidates if c.status != "error") >= 2
@@ -806,7 +1028,21 @@ async def create_message(
                             error_type=stream_metrics.get("error_type"),
                             error_message=stream_error,
                             tool_calls=stream_metrics.get("tool_calls"),
+                            langfuse_trace_id=lf_trace_id,
                         )
+                        # --- Langfuse: close generation in streaming path ---
+                        if lf_trace_id and lf_gen_id:
+                            stream_usage = _stream_usage_with_fallback(
+                                stream_metrics, estimated_input_tokens
+                            )
+                            get_langfuse_client().end_generation(
+                                generation_id=lf_gen_id,
+                                output_data=stream_metrics,
+                                usage=_langfuse_usage(stream_usage),
+                                cost=_langfuse_cost(backend_model, stream_usage),
+                                status=stream_status,
+                                error_message=stream_error,
+                            )
 
                 return StreamingResponse(
                     observed_stream(),
@@ -846,6 +1082,7 @@ async def create_message(
                     http_status=e.status_code,
                     error_type="HTTPException",
                     error_message=error_message,
+                    langfuse_trace_id=lf_trace_id,
                 )
                 return JSONResponse(
                     status_code=e.status_code,
@@ -871,7 +1108,16 @@ async def create_message(
                 usage=claude_response.get("usage"),
                 stop_reason=claude_response.get("stop_reason"),
                 tool_calls=_extract_tool_calls_from_claude_response(claude_response),
+                langfuse_trace_id=lf_trace_id,
             )
+            if lf_trace_id and lf_gen_id:
+                get_langfuse_client().end_generation(
+                    generation_id=lf_gen_id,
+                    output_data=claude_response,
+                    usage=_langfuse_usage(claude_response.get("usage")),
+                    cost=_langfuse_cost(backend_model, claude_response.get("usage")),
+                    status="success",
+                )
             claude_response["usage"] = scale_usage_for_client(
                 claude_response.get("usage"), usage_scale
             )
@@ -891,7 +1137,17 @@ async def create_message(
             http_status=e.status_code,
             error_type="HTTPException",
             error_message=str(e.detail),
+            langfuse_trace_id=lf_trace_id,
         )
+        if lf_trace_id and lf_gen_id:
+            get_langfuse_client().end_generation(
+                generation_id=lf_gen_id,
+                output_data=None,
+                usage=None,
+                model=backend_model,
+                status="error",
+                error_message=str(e.detail),
+            )
         raise
     except Exception as e:
         import traceback
@@ -913,7 +1169,17 @@ async def create_message(
             http_status=500,
             error_type=type(e).__name__,
             error_message=error_message,
+            langfuse_trace_id=lf_trace_id,
         )
+        if lf_trace_id and lf_gen_id:
+            get_langfuse_client().end_generation(
+                generation_id=lf_gen_id,
+                output_data=None,
+                usage=None,
+                model=backend_model,
+                status="error",
+                error_message=error_message,
+            )
         raise HTTPException(status_code=500, detail=error_message)
 
 
@@ -991,7 +1257,7 @@ async def test_connection():
             suggestions = [
                 f"The configured model '{config.small_model}' may not be available on this provider — "
                 f"verify against GET {config.openai_base_url.rstrip('/')}/models",
-                "Check BIG_MODEL, MIDDLE_MODEL, SMALL_MODEL, and VISION_MODEL in your .env",
+                "Check MODEL and VISION_MODEL in your .env",
                 "Token-factory providers like Nebius rotate model availability",
             ]
         elif "401" in msg or "403" in msg or "unauthorized" in msg_l or "forbidden" in msg_l:
@@ -1162,6 +1428,78 @@ async def event_logging_batch(request: Request, _: None = Depends(validate_api_k
         )
 
 
+def _chat_model_ids_from_catalog() -> list[str]:
+    """Chat-capable ids from the model catalog.
+
+    Tests may patch ``model_catalog`` with a stub that only implements
+    ``model_ids``; fall back to filtering that in that case."""
+    from src.core.model_catalog import is_chat_capable
+
+    chat_ids = getattr(model_catalog, "chat_model_ids", None)
+    if callable(chat_ids):
+        return chat_ids()
+    return [m for m in model_catalog.model_ids() if is_chat_capable(m)]
+
+
+@router.get("/v1/upstream-models")
+async def upstream_models(_: None = Depends(validate_api_key)):
+    """Chat-capable upstream model ids (for the session-startup picker)."""
+    from src.core.model_catalog import is_chat_capable
+
+    ids = _chat_model_ids_from_catalog()
+    if not ids:
+        ids = [
+            m["id"]
+            for m in openai_client.list_models()
+            if m.get("id") and is_chat_capable(m["id"])
+        ]
+    return {"data": ids}
+
+
+def _available_upstream_model_ids() -> list[str]:
+    from src.core.model_catalog import is_chat_capable
+
+    ids = _chat_model_ids_from_catalog()
+    if not ids:
+        ids = [
+            m["id"]
+            for m in openai_client.list_models()
+            if m.get("id") and is_chat_capable(m["id"])
+        ]
+    return ids
+
+
+@router.get("/v1/session-model")
+async def session_model(
+    session: str = Query(..., min_length=1), _: None = Depends(validate_api_key)
+):
+    """Current runtime model override for a session (null = no override)."""
+    from src.core.session_settings import get_runtime_model
+
+    return {"session": session, "model": get_runtime_model(session)}
+
+
+@router.put("/v1/session-model")
+async def set_session_model(
+    payload: dict, _: None = Depends(validate_api_key)
+):
+    """Set a per-session runtime model override.
+
+    Body: {"session": "<name>", "model": "<upstream model id>"}. The override wins
+    over the forwarder's x-session-model header on the next /v1/messages request.
+    """
+    from src.core.session_settings import set_runtime_model
+
+    session = str(payload.get("session") or "").strip()
+    model = str(payload.get("model") or "").strip()
+    if not session or not model:
+        raise HTTPException(status_code=400, detail="session and model are required")
+    if model not in _available_upstream_model_ids():
+        raise HTTPException(status_code=400, detail=f"unknown model: {model}")
+    set_runtime_model(session, model)
+    return {"ok": True, "session": session, "model": model}
+
+
 @router.get("/v1/models")
 async def list_models(_: None = Depends(validate_api_key)):
     """List available models — Claude aliases + upstream-discovered models.
@@ -1253,11 +1591,14 @@ async def list_models(_: None = Depends(validate_api_key)):
                     }
                 )
 
-    # Fetch upstream models dynamically and append any not already listed
+    # Fetch upstream models dynamically and append any not already listed.
+    # Skip embedding/rerank models — they can't serve chat/tool calls.
+    from src.core.model_catalog import is_chat_capable
+
     upstream_models = openai_client.list_models()
     for m in upstream_models:
         model_id = m.get("id")
-        if model_id and model_id not in seen:
+        if model_id and is_chat_capable(model_id) and model_id not in seen:
             seen.add(model_id)
             model_entries.append(
                 {

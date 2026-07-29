@@ -32,15 +32,14 @@ class InstallState:
     configure_statusline: bool = True
     configure_codex_config: bool = True
     configure_profiles: bool = True
+    reinstall_shell: bool = False  # overwrite already-configured shell profiles
     python_version: str = ""
     has_pip: bool = False
     has_curl: bool = False
     api_key: str = ""
     port: int = 8083
     base_url: str = "https://api.tokenfactory.nebius.com/v1"
-    big_model: str = ""
-    middle_model: str = ""
-    small_model: str = ""
+    model: str = ""
     vision_model: str = ""
     shell_type: ShellType = ShellType.UNKNOWN
     shell_rc: str = ""
@@ -52,6 +51,7 @@ class InstallState:
     deps_installed: bool = False
     models_fetched: bool = False
     available_models: list[str] = field(default_factory=list)
+    model_context_lengths: dict[str, int] = field(default_factory=dict)  # model_id → context_length
     smoke_test_passed: bool = False
 
 
@@ -173,7 +173,13 @@ def safe_merge_settings(statusline_command: str, repo_root: pathlib.Path) -> dic
             if existing_cmd.strip() == new_cmd.strip():
                 return {"action": "exists", "message": "statusLine already configured identically."}
             else:
-                return {"action": "updated", "message": "statusLine exists with different value."}
+                # Different existing statusLine: overwrite it. A backup was already
+                # taken above. Previously this branch returned without writing, so
+                # the installer's "Overwrite" modal silently left the stale command
+                # in place — upgrades never landed.
+                existing["statusLine"] = {"type": "command", "command": statusline_command}
+                settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+                return {"action": "updated", "message": "statusLine overwritten with the new value."}
 
         existing["statusLine"] = {"type": "command", "command": statusline_command}
         settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
@@ -202,14 +208,23 @@ def write_env(state: InstallState) -> None:
                 key, val = line.split("=", 1)
                 existing[key] = val
 
+    # Resolve context limits: use the catalog value when available, else keep
+    # whatever is already in .env / .env.example (0 → runtime catalog decides).
+    def _ctx(model_id: str) -> str:
+        ctx = state.model_context_lengths.get(model_id, 0) if model_id else 0
+        # Ignore implausibly small catalog values (Nebius returns 8000 as a
+        # placeholder for models with 128K+ real windows). Writing 0 here lets
+        # the proxy runtime fall back to its DEFAULT_CONTEXT_LIMIT (128K).
+        return str(ctx) if ctx >= 16384 else "0"
+
     # What the TUI has collected
     state_overrides: dict[str, str] = {
         "OPENAI_API_KEY": state.api_key,
         "PORT": str(state.port),
-        "BIG_MODEL": state.big_model,
-        "MIDDLE_MODEL": state.middle_model,
-        "SMALL_MODEL": state.small_model,
+        "MODEL": state.model,
         "VISION_MODEL": state.vision_model,
+        "MODEL_CONTEXT_LIMIT": _ctx(state.model),
+        "VISION_MODEL_CONTEXT_LIMIT": _ctx(state.vision_model),
     }
 
     # Build merged lines from the .env.example template
@@ -326,11 +341,15 @@ def sync_pip_install() -> tuple[bool, str]:
 
 
 def fetch_nebius_models(api_key: str, base_url: str) -> dict:
-    """Fetch available models from Nebius."""
+    """Fetch available models from Nebius, including context lengths.
+
+    Uses ?verbose=true so each entry carries context_length, which the
+    installer writes to MODEL_CONTEXT_LIMIT / VISION_MODEL_CONTEXT_LIMIT.
+    """
     import ssl
     import urllib.request
 
-    endpoint = base_url.rstrip("/") + "/models"
+    endpoint = base_url.rstrip("/") + "/models?verbose=true"
     req = urllib.request.Request(
         endpoint, headers={"Authorization": f"Bearer {api_key}"}
     )
@@ -338,14 +357,26 @@ def fetch_nebius_models(api_key: str, base_url: str) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
             data = json.load(resp)
-            models = [m["id"] for m in data.get("data", [])]
-            return {"ok": True, "models": models}
+            models = []
+            context_lengths: dict[str, int] = {}
+            for m in data.get("data", []):
+                mid = m.get("id")
+                if not mid:
+                    continue
+                models.append(mid)
+                ctx_len = m.get("context_length")
+                if ctx_len:
+                    try:
+                        context_lengths[mid] = int(ctx_len)
+                    except (TypeError, ValueError):
+                        pass
+            return {"ok": True, "models": models, "context_lengths": context_lengths}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 def pick_default_models(available: list[str]) -> dict[str, str]:
-    """Return {BIG_MODEL, MIDDLE_MODEL, SMALL_MODEL, VISION_MODEL} from available."""
+    """Return {MODEL, VISION_MODEL} from available."""
 
     def pick(candidates: list[str]) -> str:
         for c in candidates:
@@ -354,21 +385,9 @@ def pick_default_models(available: list[str]) -> dict[str, str]:
         return available[0] if available else ""
 
     return {
-        "BIG_MODEL": pick([
+        "MODEL": pick([
             "deepseek-ai/DeepSeek-V4-Pro",
             "Qwen/Qwen3-235B-A22B-Instruct-2507",
-            "meta-llama/Llama-3.3-70B-Instruct",
-            "moonshotai/Kimi-K2.6",
-        ]),
-        "MIDDLE_MODEL": pick([
-            "deepseek-ai/DeepSeek-V3.2",
-            "Qwen/Qwen3-235B-A22B-Instruct-2507",
-            "meta-llama/Llama-3.3-70B-Instruct",
-            "moonshotai/Kimi-K2.6",
-        ]),
-        "SMALL_MODEL": pick([
-            "deepseek-ai/DeepSeek-V3.2",
-            "Qwen/Qwen3-32B",
             "meta-llama/Llama-3.3-70B-Instruct",
             "moonshotai/Kimi-K2.6",
         ]),
@@ -427,22 +446,145 @@ def append_shell_function(
     return True
 
 
-def _append_bash_zsh(rc_path: str, port: int, repo_root: pathlib.Path) -> None:
-    func = f"""
+# Boundary markers for the Claude+Codex function block we install. The block
+# starts at the Claude comment header and ends at the codex alias / function,
+# so a reinstall strips exactly the previously-appended block and rewrites it.
+_BASH_BLOCK_START = "# Claude Shell Function"
+_BASH_BLOCK_END = "alias codexius='codex --proxy'"
+_PWSH_BLOCK_START = "# Claude Shell Function"
+_PWSH_BLOCK_END_MARKER = "codex --proxy @CodexArgs"
+
+
+def reinstall_shell_function(
+    shell_type: ShellType,
+    rc_path: str,
+    port: int,
+    repo_root: pathlib.Path,
+) -> bool:
+    """Overwrite the existing Claude+Codex function block in a profile.
+
+    Unlike append_shell_function, this first removes any previously-installed
+    block (bounded by the Claude header and the codex alias/function close) so
+    re-running the installer on an already-configured machine refreshes the
+    function instead of leaving the stale version in place. The rc file is
+    backed up before the edit.
+    """
+    if not rc_path or not os.path.isfile(rc_path):
+        return append_shell_function(shell_type, rc_path, port, repo_root)
+
+    backup = f"{rc_path}.bak.{int(os.path.getmtime(rc_path))}"
+    shutil.copy2(rc_path, backup)
+
+    text = pathlib.Path(rc_path).read_text(encoding="utf-8")
+    start = text.find(_BASH_BLOCK_START if shell_type != ShellType.PWSH else _PWSH_BLOCK_START)
+    if start == -1:
+        # No prior block — just append.
+        append_shell_function(shell_type, rc_path, port, repo_root)
+        return True
+
+    if shell_type != ShellType.PWSH:
+        end = text.find(_BASH_BLOCK_END, start)
+        if end == -1:
+            append_shell_function(shell_type, rc_path, port, repo_root)
+            return True
+        # Include the trailing newline after the alias line.
+        end += len(_BASH_BLOCK_END)
+        while end < len(text) and text[end] == "\n":
+            end += 1
+    else:
+        # PowerShell block ends after the codexius function's closing brace.
+        marker = text.find(_PWSH_BLOCK_END_MARKER, start)
+        if marker == -1:
+            append_shell_function(shell_type, rc_path, port, repo_root)
+            return True
+        close = text.find("}", marker)
+        if close == -1:
+            append_shell_function(shell_type, rc_path, port, repo_root)
+            return True
+        end = close + 1
+        while end < len(text) and text[end] == "\n":
+            end += 1
+
+    # Strip the old block (and any leading blank line directly before it so
+    # we don't accumulate stray newlines across reinstalls).
+    strip_start = start
+    while strip_start > 0 and text[strip_start - 1] == "\n":
+        strip_start -= 1
+    new_text = text[:strip_start].rstrip("\n") + "\n\n" + text[end:]
+
+    if shell_type == ShellType.PWSH:
+        block = _pwsh_block_text(port, repo_root)
+    else:
+        block = _bash_zsh_block_text(port, repo_root)
+
+    new_text = new_text.rstrip("\n") + "\n" + block
+    pathlib.Path(rc_path).write_text(new_text, encoding="utf-8")
+    return True
+
+
+def _bash_zsh_block_text(port: int, repo_root: pathlib.Path) -> str:
+    """Return the exact bash/zsh function block (mirrors _append_bash_zsh)."""
+    return f"""
 # Claude Shell Function — enables claude, claude --proxy, and claudius
 claude() {{
     local main_proxy="http://localhost:{port}"
     local repo_root="{repo_root}"
     if [[ "$1" == "--proxy" ]]; then
+        shift
         printf "\\033[38;5;129m▐▛▜▌ Claude via Proxy\\033[0m  \\033[38;5;244m→ bearer auth via local proxy\\033[0m\\n"
-        local default_name="session-$(date +%Y%m%d-%H%M%S)"
-        printf "\\033[38;5;244mSession name\\033[0m [\\033[38;5;75m%s\\033[0m]: " "$default_name"
-        read -r session_name
-        session_name="${{session_name:-$default_name}}"
+        local session_name="" sel_model="" ens_mode="" ens_models="" ens_judge=""
+        if [[ "$1" == "--bypass" ]]; then
+            # Non-interactive defaults for agent-to-agent orchestration:
+            # session=Agent2Agent, model=.env default (no override), ensemble off.
+            shift
+            session_name="Agent2Agent"
+            ens_mode="off"
+            printf "\\033[38;5;244m  bypass: session=Agent2Agent, model=.env default, ensemble=off\\033[0m\\n"
+        else
+            local default_name="session-$(date +%Y%m%d-%H%M%S)"
+            printf "\\033[38;5;244mSession name\\033[0m [\\033[38;5;75m%s\\033[0m]: " "$default_name"
+            read -r session_name
+            session_name="${{session_name:-$default_name}}"
+
+            # Fetch upstream models for the picker (newline-separated).
+            local models_raw
+            models_raw=$(curl -s "$main_proxy/v1/upstream-models" -H "x-api-key: claude-local" \\
+                | python3 -c 'import sys,json; print("\\n".join(json.load(sys.stdin).get("data",[])))' 2>/dev/null)
+            local -a models=()
+            while IFS= read -r line; do [[ -n "$line" ]] && models+=("$line"); done <<< "$models_raw"
+
+            if [[ ${{#models[@]}} -gt 0 ]]; then
+                printf "\\033[38;5;244mModel:\\033[0m\\n"
+                local i=1; for m in "${{models[@]}}"; do printf "  %d) %s\\n" "$i" "$m"; ((i++)); done
+                printf "Choose [1]: "; read -r mi; mi="${{mi:-1}}"
+                sel_model="${{models[$((mi-1))]:-}}"
+            fi
+
+            printf "Ensemble? (y/N): "; read -r ens_on
+            if [[ "$ens_on" =~ ^[Yy] ]]; then
+                printf "  Mode: 1) hedge  2) approval [1]: "; read -r mm
+                if [[ "$mm" == "2" ]]; then ens_mode="approval"; else ens_mode="hedge"; fi
+                printf "  Judge model [%s]: " "${{sel_model:-none}}"; read -r ens_judge
+                printf "  Ensemble models (comma numbers, e.g. 1,2): "; read -r picks
+                local -a chosen=()
+                IFS=',' read -ra idxs <<< "$picks"
+                for idx in "${{idxs[@]}}"; do
+                    idx="${{idx// /}}"; [[ -n "${{models[$((idx-1))]:-}}" ]] && chosen+=("${{models[$((idx-1))]}}")
+                done
+                ens_models=$(IFS=,; echo "${{chosen[*]}}")
+                if [[ ${{#chosen[@]}} -lt 2 ]]; then
+                    printf "\\033[38;5;197m  Need >=2 models for ensemble — disabling.\\033[0m\\n"; ens_mode=""
+                fi
+            fi
+        fi
+
         local local_port
         local_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
         mkdir -p "$repo_root/logs"
-        python3 "$repo_root/scripts/session_forwarder.py" "$local_port" "localhost:{port}" "$session_name" >> "$repo_root/logs/session-forwarder.log" 2>&1 &
+        python3 "$repo_root/scripts/session_forwarder.py" "$local_port" "localhost:{port}" "$session_name" \\
+            --model "$sel_model" --ensemble-mode "$ens_mode" \\
+            --ensemble-models "$ens_models" --ensemble-judge "$ens_judge" \\
+            >> "$repo_root/logs/session-forwarder.log" 2>&1 &
         local forwarder_pid=$!
         sleep 0.5
         local forwarder_url="http://localhost:$local_port"
@@ -450,7 +592,9 @@ claude() {{
             unset ANTHROPIC_API_KEY
             export ANTHROPIC_AUTH_TOKEN="claude-local"
             export ANTHROPIC_BASE_URL="$forwarder_url"
-            command claude "${{@:2}}"
+            export NEBIUS_SESSION_MODEL="$sel_model"
+            export NEBIUS_SESSION_NAME="$session_name"
+            command claude "$@"
         )
         local claude_exit=$?
         kill "$forwarder_pid" 2>/dev/null || true
@@ -488,12 +632,11 @@ codex() {{
 }}
 alias codexius='codex --proxy'
 """
-    with open(rc_path, "a", encoding="utf-8") as f:
-        f.write(func)
 
 
-def _append_pwsh(rc_path: str, port: int, repo_root: pathlib.Path) -> None:
-    func = f"""
+def _pwsh_block_text(port: int, repo_root: pathlib.Path) -> str:
+    """Return the exact PowerShell function block (mirrors _append_pwsh)."""
+    return f"""
 # Claude Shell Function - enables claude, claude --proxy, and claudius
 function claude {{
     param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $ClaudeArgs)
@@ -505,31 +648,61 @@ function claude {{
     $oldBaseUrl = $env:ANTHROPIC_BASE_URL
     if ($ClaudeArgs.Count -gt 0 -and $ClaudeArgs[0] -eq "--proxy") {{
         Write-Host "`e[38;5;129m▐▛▜▌ Claude via Proxy`e[0m  `e[38;5;244m-> bearer auth via local proxy`e[0m"
-        $defaultName = "session-" + (Get-Date -Format "yyyyMMdd-HHmmss")
-        Write-Host "Session name [`e[38;5;75m$defaultName`e[0m]: " -NoNewline
-        [string] $sessionName = Read-Host
-        if ([string]::IsNullOrWhiteSpace($sessionName)) {{ $sessionName = $defaultName }}
+        $sessionName = ""; $selModel = ""; $ensMode = ""; $ensModels = ""; $ensJudge = ""
+        $argOffset = 1
+        if ($ClaudeArgs.Count -gt 1 -and $ClaudeArgs[1] -eq "--bypass") {{
+            # Non-interactive defaults for agent-to-agent orchestration:
+            # session=Agent2Agent, model=.env default (no override), ensemble off.
+            $argOffset = 2
+            $sessionName = "Agent2Agent"; $ensMode = "off"
+            Write-Host "`e[38;5;244m  bypass: session=Agent2Agent, model=.env default, ensemble=off`e[0m"
+        }} else {{
+            $defaultName = "session-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+            Write-Host "Session name [`e[38;5;75m$defaultName`e[0m]: " -NoNewline
+            [string] $sessionName = Read-Host
+            if ([string]::IsNullOrWhiteSpace($sessionName)) {{ $sessionName = $defaultName }}
+            $modelsResp = try {{ Invoke-RestMethod -Uri "$mainProxy/v1/upstream-models" -Headers @{{ 'x-api-key' = 'claude-local' }} }} catch {{ $null }}
+            $models = @(); if ($modelsResp) {{ $models = $modelsResp.data }}
+            if ($models.Count -gt 0) {{
+                Write-Host "Model:"; for ($i=0; $i -lt $models.Count; $i++) {{ Write-Host ("  {{0}}) {{1}}" -f ($i+1), $models[$i]) }}
+                $mi = Read-Host "Choose [1]"; if ([string]::IsNullOrWhiteSpace($mi)) {{ $mi = 1 }}
+                $selModel = $models[[int]$mi - 1]
+            }}
+            $ensOn = Read-Host "Ensemble? (y/N)"
+            if ($ensOn -match '^[Yy]') {{
+                $mm = Read-Host "  Mode: 1) hedge 2) approval [1]"; $ensMode = $(if ($mm -eq '2') {{ 'approval' }} else {{ 'hedge' }})
+                $ensJudge = Read-Host "  Judge model [$selModel]"
+                $picks = Read-Host "  Ensemble models (comma numbers, e.g. 1,2)"
+                $chosen = @(); foreach ($idx in $picks -split ',') {{ $idx = $idx.Trim(); if ($idx) {{ $chosen += $models[[int]$idx - 1] }} }}
+                $ensModels = ($chosen -join ',')
+                if ($chosen.Count -lt 2) {{ Write-Host "  Need >=2 models for ensemble — disabling."; $ensMode = "" }}
+            }}
+        }}
         [int] $localPort = python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()"
         $forwarderJob = Start-Job -ScriptBlock {{
-            param($port, $target, $name, $repo)
-            python3 "$repo/scripts/session_forwarder.py" $port $target $name
-        }} -ArgumentList $localPort, "localhost:{port}", $sessionName, $repoRoot
+            param($port, $target, $name, $repo, $model, $emode, $emodels, $ejudge)
+            python3 "$repo/scripts/session_forwarder.py" $port $target $name --model $model --ensemble-mode $emode --ensemble-models $emodels --ensemble-judge $ejudge
+        }} -ArgumentList $localPort, "localhost:{port}", $sessionName, $repoRoot, $selModel, $ensMode, $ensModels, $ensJudge
         Start-Sleep -Milliseconds 800
         [string[]] $remainingArgs = @()
-        if ($ClaudeArgs.Count -gt 1) {{
-            $remainingArgs = [string[]] $ClaudeArgs[1..($ClaudeArgs.Count - 1)]
+        if ($ClaudeArgs.Count -gt $argOffset) {{
+            $remainingArgs = [string[]] $ClaudeArgs[$argOffset..($ClaudeArgs.Count - 1)]
         }}
         $forwarderUrl = "http://localhost:$localPort"
         try {{
             $env:ANTHROPIC_AUTH_TOKEN = "claude-local"
             Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
             $env:ANTHROPIC_BASE_URL = $forwarderUrl
+            $env:NEBIUS_SESSION_MODEL = $selModel
+            $env:NEBIUS_SESSION_NAME = $sessionName
             & $claudeCommand @remainingArgs
         }} finally {{
             if ($forwarderJob) {{ Stop-Job $forwarderJob -ErrorAction SilentlyContinue; Remove-Job $forwarderJob -ErrorAction SilentlyContinue }}
             if ($null -eq $oldAuthToken) {{ Remove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_AUTH_TOKEN = $oldAuthToken }}
             if ($null -eq $oldApiKey) {{ Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_API_KEY = $oldApiKey }}
             if ($null -eq $oldBaseUrl) {{ Remove-Item Env:ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue }} else {{ $env:ANTHROPIC_BASE_URL = $oldBaseUrl }}
+            Remove-Item Env:NEBIUS_SESSION_MODEL -ErrorAction SilentlyContinue
+            Remove-Item Env:NEBIUS_SESSION_NAME -ErrorAction SilentlyContinue
         }}
     }} else {{
         Write-Host "`e[38;5;46m▐▛▜▌ Claude Direct`e[0m  `e[38;5;244m-> subscription login auth`e[0m"
@@ -582,8 +755,16 @@ function codexius {{
     codex --proxy @CodexArgs
 }}
 """
+
+
+def _append_bash_zsh(rc_path: str, port: int, repo_root: pathlib.Path) -> None:
     with open(rc_path, "a", encoding="utf-8") as f:
-        f.write(func)
+        f.write(_bash_zsh_block_text(port, repo_root))
+
+
+def _append_pwsh(rc_path: str, port: int, repo_root: pathlib.Path) -> None:
+    with open(rc_path, "a", encoding="utf-8") as f:
+        f.write(_pwsh_block_text(port, repo_root))
 
 
 # ── Codex Config ──
@@ -609,7 +790,7 @@ def _normalize_model_for_codex(model: str) -> str:
 
 
 def write_codex_config(
-    big_model: str,
+    model: str,
     proxy_port: int,
     repo_root: pathlib.Path,
 ) -> dict:
@@ -634,7 +815,7 @@ def write_codex_config(
                 env_value = line.split("=", 1)[1].strip('"\'')
                 break
 
-    model = _normalize_model_for_codex(big_model)
+    model = _normalize_model_for_codex(model)
     base_url = f"http://127.0.0.1:{proxy_port}/v1"
 
     if config_path.suffix == ".json":

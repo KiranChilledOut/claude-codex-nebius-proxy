@@ -18,9 +18,10 @@ class ModelPrice:
 class PricingCatalog:
     """Env-configured pricing lookup for backend model usage."""
 
-    def __init__(self, raw_json: str):
+    def __init__(self, raw_json: str, dynamic=None):
         self.raw_json = raw_json or "{}"
         self.prices = self._load_prices(self.raw_json)
+        self.dynamic = dynamic
 
     def quote(self, model: Optional[str], input_tokens: int, output_tokens: int) -> Dict[str, Any]:
         if model and model.startswith("local/"):
@@ -53,9 +54,15 @@ class PricingCatalog:
         }
 
     def get(self, model: Optional[str]) -> Optional[ModelPrice]:
-        if not model:
-            return self.prices.get("default") or self.prices.get("*")
-        return self.prices.get(model) or self.prices.get("default") or self.prices.get("*")
+        if model:
+            static = self.prices.get(model)
+            if static is not None:
+                return static
+            if self.dynamic is not None:
+                dyn = self.dynamic.get_pricing(model)
+                if dyn is not None:
+                    return dyn
+        return self.prices.get("default") or self.prices.get("*")
 
     def as_list(self) -> list:
         return [

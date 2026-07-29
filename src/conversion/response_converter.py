@@ -5,14 +5,15 @@ import re
 import time
 import traceback
 import uuid
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, List, Optional
 
 from fastapi import HTTPException, Request
 
 from src.conversion.request_converter import _count_tokens_text
 from src.core.config import config
 from src.core.constants import Constants
-from src.models.claude import ClaudeMessagesRequest
+from src.models.claude import ClaudeMessagesRequest, ClaudeTool
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,176 @@ _KIMI_TOKEN_PATTERN = re.compile(
     r"<\|tool_calls?_section_(?:begin|end)\|>|<\|tool_call_(?:begin|end)\|>|"
     r"<\|tool_call_argument_begin\|>|functions\.[A-Za-z0-9_.\-]+:\d+"
 )
+
+# ---------------------------------------------------------------------------
+# Inline-text tool-call lifters (extensible registry)
+# ---------------------------------------------------------------------------
+# Some Open-Chat-Completions backends (notably moonshotai/Kimi-K2.7-Code) emit
+# tool calls not as structured `delta.tool_calls`, but as literal control-token
+# text inside `delta.content`:
+#
+#         chatcmpl-tool-<hex>
+#       {"command": "...", "description": "..."}
+#
+#
+# Note Kimi-K2 places a bare tool-call id (not functions.NAME:N) after
+#  , so the function NAME is absent from the emission and
+# must be recovered from the args keys against the request's tool schemas.
+#
+# The streaming text path (_process_text_fragment) otherwise streams these
+# tokens straight through, ending the turn as end_turn with no executable
+# tool — Claude Code stalls and the turn is un-recoverable. Each registered
+# extractor lifts such a section into one _LiftedToolCall per call. Adding
+# support for a future broken-emit format = write one extractor + append it
+# to _INLINE_TOOL_EXTRACTORS.
+
+_KIMI_SECTION = re.compile(
+    r"<\|tool_calls_section_begin\|>(.*?)<\|tool_calls_section_end\|>",
+    re.DOTALL,
+)
+# Captures the id-or-name token and the args JSON. Tolerates the absence of
+# <|tool_call_argument_end|> (which Kimi-K2 omits). `[^<]*?` for the id/name
+# accepts `chatcmpl-tool-<hex>` and `functions.NAME:N`; non-greedy args stop
+# at the first  .
+_KIMI_CALL = re.compile(
+    r"<\|tool_call_begin\|>\s*([^<]*?)\s*"
+    r"<\|tool_call_argument_begin\|>\s*(.*?\})\s*<\|tool_call_end\|>",
+    re.DOTALL,
+)
+# Bare-args variant (Kimi-K2.7-Code, seen 2026-07): <|tool_call_argument_begin|>
+# is omitted entirely — the args JSON follows the id/name token directly:
+#   <|tool_call_begin|> chatcmpl-tool-<hex>   {"file_path": ...} <|tool_call_end|>
+# `[^<{]*?` for the token cannot cross into `<|tool_call_argument_begin|>` or
+# the args `{`, so this never mis-parses the marked format above.
+_KIMI_BARE_CALL = re.compile(
+    r"<\|tool_call_begin\|>\s*([^<{]*?)\s*(\{.*?\})\s*<\|tool_call_end\|>",
+    re.DOTALL,
+)
+_NO_NAME_ID = re.compile(r"^(chatcmpl-tool-|functions\.)")
+
+
+@dataclass
+class _LiftedToolCall:
+    name: Optional[str]  # None when the format omits the name (Kimi-K2 id-only)
+    id: Optional[str]
+    raw_args: str
+
+
+def _extract_marked_section_calls(
+    text: str, call_pattern: "re.Pattern[str]"
+) -> List[_LiftedToolCall]:
+    """Parse <|tool_calls_section_*|> sections with the given per-call regex."""
+    calls: List[_LiftedToolCall] = []
+    for sec in _KIMI_SECTION.finditer(text):
+        for m in call_pattern.finditer(sec.group(1)):
+            token = m.group(1).strip()
+            raw_args = m.group(2).strip()
+            if _NO_NAME_ID.match(token):
+                name = None
+                call_id = token if token.startswith("chatcmpl-tool-") else None
+            else:
+                name = _clean_tool_name(token) if token else None
+                call_id = None
+            calls.append(_LiftedToolCall(name=name, id=call_id, raw_args=raw_args))
+    return calls
+
+
+def _extract_kimi_section_tool_calls(text: str) -> List[_LiftedToolCall]:
+    """Parse Kimi-K2 inline control-token sections into lifted tool calls."""
+    return _extract_marked_section_calls(text, _KIMI_CALL)
+
+
+def _extract_kimi_bare_args_tool_calls(text: str) -> List[_LiftedToolCall]:
+    """Kimi-K2.7-Code variant with no <|tool_call_argument_begin|> token."""
+    return _extract_marked_section_calls(text, _KIMI_BARE_CALL)
+
+
+# Registry: append a new extractor here to support another inline format.
+_INLINE_TOOL_EXTRACTORS: List[Callable[[str], List[_LiftedToolCall]]] = [
+    _extract_kimi_section_tool_calls,
+    _extract_kimi_bare_args_tool_calls,
+]
+
+# Section-open tokens that begin an inline tool-call block. Used by the
+# streaming hold-back guard: only a trailing suffix that is a prefix of one
+# of these is held back across a chunk boundary, so ordinary text containing
+# a bare "<" (e.g. "</thinking>") is never stalled. Append a new token here
+# when adding an extractor whose section opener differs.
+_INLINE_SECTION_OPENERS: List[str] = [
+    "<" + "|tool_calls_section_begin" + "|>",
+]
+
+
+def _inline_open_prefix_len(buffer: str) -> int:
+    """Length of the longest trailing suffix of buffer that is a proper prefix
+    of a known section-open token, or 0 if none.
+
+    Used to decide how much (if any) of a chunk tail to hold back until the
+    next fragment arrives, so a control token split across chunks is not
+    prematurely emitted as text.
+    """
+    best = 0
+    for opener in _INLINE_SECTION_OPENERS:
+        # Try the longest suffix that could still grow into `opener`.
+        max_check = min(len(buffer), len(opener) - 1)
+        for n in range(max_check, 0, -1):
+            if n <= best:
+                break
+            if opener.startswith(buffer[-n:]):
+                best = n
+                break
+    return best
+
+
+def _lift_inline_tool_calls(text: str) -> List[_LiftedToolCall]:
+    """Run the registry; return calls from the first extractor that matches."""
+    for extractor in _INLINE_TOOL_EXTRACTORS:
+        calls = extractor(text)
+        if calls:
+            return calls
+    return []
+
+
+def _resolve_tool_name(
+    lifted: _LiftedToolCall, tools: List[ClaudeTool]
+) -> Optional[str]:
+    """Recover a missing function name from the args keys vs tool schemas.
+
+    Kimi-K2 emits only a tool-call id, not the name. We match the top-level
+    arg keys against each tool's input_schema property keys and pick the tool
+    with the largest key overlap (requiring at least one shared key). A tiny
+    explicit key-hint map backstops the common `command`->Bash case when no
+    tools are supplied (e.g. schema-less only).
+    """
+    if lifted.name:
+        return lifted.name
+    parsed, _ = _try_repair_json(lifted.raw_args)
+    if not isinstance(parsed, dict) or not parsed:
+        return None
+    arg_keys = set(parsed.keys())
+
+    best_name: Optional[str] = None
+    best_overlap = 0
+    for tool in tools or []:
+        if tool.is_schema_less() or not tool.input_schema:
+            continue
+        prop_keys = set((tool.input_schema.get("properties") or {}).keys())
+        if not prop_keys:
+            continue
+        overlap = len(arg_keys & prop_keys)
+        # Need at least one shared key; prefer a tool whose schema is a
+        # superset of the emitted keys, breaking ties by largest overlap.
+        if overlap > best_overlap:
+            best_name = tool.name
+            best_overlap = overlap
+    if best_name:
+        return best_name
+
+    _KEY_HINT = {"command": "Bash"}
+    for key in arg_keys:
+        if key in _KEY_HINT:
+            return _KEY_HINT[key]
+    return None
 
 
 def _clean_tool_name(raw_name: str) -> str:
@@ -470,6 +641,20 @@ def convert_openai_to_claude_response(
 
     # --- Feature 1: handle <think> tags in text content ---
     text_content = message.get("content")
+# Inline-text tool-call lift (non-streaming): when a backend emits tool
+# calls as control-token sections inside text_content, lift them into
+# tool_use blocks (below) and strip the tokens from visible text so raw
+# tokens never reach the client. request_tools recovers the name Kimi-K2
+# omits from its id-only emission.
+    request_tools_ns: List[ClaudeTool] = list(getattr(original_request, "tools", None) or [])
+    lifted_from_text: List[_LiftedToolCall] = []
+    if isinstance(text_content, str):
+        lifted_from_text = _lift_inline_tool_calls(text_content)
+        if lifted_from_text:
+            # Drop whole lifted sections (id + args included), then any stray
+            # control tokens outside a complete section.
+            text_content = _KIMI_SECTION.sub(" ", text_content)
+            text_content = _KIMI_TOKEN_PATTERN.sub(" ", text_content).strip()
     if text_content is not None:
         has_think = "<think>" in text_content.lower()
         if surface_thinking and has_think:
@@ -548,11 +733,42 @@ def convert_openai_to_claude_response(
                 }
             )
 
+    # Inline-lifted tool calls (non-streaming): emit them as tool_use blocks
+    # and dedup against any structured tool_calls already emitted this turn.
+    for lifted in lifted_from_text:
+        resolved = _resolve_tool_name(lifted, request_tools_ns)
+        effective_name = resolved or "_inline_tool"
+        actual_name, arguments_str, parsed = _finalize_tool_args(effective_name, lifted.raw_args)
+        if parsed is not None:
+            arguments = parsed
+        else:
+            arguments = {"raw_arguments": arguments_str}
+        try:
+            signature = (
+                actual_name,
+                json.dumps(arguments, sort_keys=True, ensure_ascii=False),
+            )
+        except (TypeError, ValueError):
+            signature = (actual_name, str(arguments))
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        content_blocks.append(
+            {
+                "type": Constants.CONTENT_TOOL_USE,
+                "id": lifted.id or f"tool_{uuid.uuid4()}",
+                "name": actual_name,
+                "input": arguments,
+            }
+        )
+
     # Ensure at least one content block
     if not content_blocks:
         content_blocks.append({"type": Constants.CONTENT_TEXT, "text": ""})
 
     stop_reason = _map_finish_reason(choice.get("finish_reason"))
+    if lifted_from_text:
+        stop_reason = Constants.STOP_TOOL_USE
 
     # --- Feature 5: full usage with cache fields ---
     usage = _extract_usage(openai_response.get("usage"))
@@ -653,6 +869,14 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     started_blocks = []  # track indices of blocks we've started (for Fix 4)
     stopped_blocks = set()  # track indices already stopped (avoid double-stop)
 
+    # Snapshot of the request's tools, used by the inline-text tool-call
+    # lifter to recover a function name Kimi-K2 omits from its emission.
+    request_tools: List[ClaudeTool] = list(getattr(original_request, "tools", None) or [])
+    # Buffer/housekeeping for inline-text tool calls lifted out of delta.content.
+    inline_text_buffer = ""
+    lifted_tool_calls = []  # emitted _LiftedToolCall entries (observability + dedup)
+    lifted_seen_signatures = set()
+
     if observability_context is not None:
         observability_context.setdefault("usage", usage_data)
         observability_context.setdefault("tool_calls", observed_tool_calls)
@@ -674,6 +898,174 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                 },
             )
         return ""
+
+    def _emit_lifted_tool_block(lifted: "_LiftedToolCall") -> str:
+        """Emit a complete tool_use block for an inline-text-lifted tool call.
+
+        Closes any open text block first, then emits content_block_start
+        (tool_use), a single sanitized input_json_delta, and content_block_stop.
+        Dedups calls with an identical (name, args) signature within this turn.
+        Returns the concatenated SSE string (possibly "" if deduped).
+        """
+        nonlocal text_block_started, final_stop_reason, estimated_output_tokens
+        name = _resolve_tool_name(lifted, request_tools)
+        # Placeholder keeps the block executable when no name is recoverable;
+        # Claude Code will re-prompt on the next turn (same as raw_arguments).
+        effective_name = name or "_inline_tool"
+        final_name, sanitized, parsed = _finalize_tool_args(effective_name, lifted.raw_args)
+
+        try:
+            sig = (
+                final_name,
+                json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+                if parsed is not None
+                else (sanitized or ""),
+            )
+        except (TypeError, ValueError):
+            sig = (final_name, sanitized or "")
+        if sig in lifted_seen_signatures:
+            logger.info(f"[DEDUP] Dropped duplicate inline tool_use {final_name}")
+            return ""
+        lifted_seen_signatures.add(sig)
+
+        chunk = ""
+        # Close any open text block before starting a tool block.
+        if text_block_started:
+            text_idx = _get_text_block_index()
+            if text_idx not in stopped_blocks:
+                chunk += _sse(
+                    Constants.EVENT_CONTENT_BLOCK_STOP,
+                    {
+                        "type": Constants.EVENT_CONTENT_BLOCK_STOP,
+                        "index": text_idx,
+                    },
+                )
+                stopped_blocks.add(text_idx)
+            text_block_started = False
+
+        idx = _next_index()
+        tool_id = lifted.id or f"tool_{uuid.uuid4().hex[:24]}"
+        started_blocks.append(("tool", idx))
+        chunk += _sse(
+            Constants.EVENT_CONTENT_BLOCK_START,
+            {
+                "type": Constants.EVENT_CONTENT_BLOCK_START,
+                "index": idx,
+                "content_block": {
+                    "type": Constants.CONTENT_TOOL_USE,
+                    "id": tool_id,
+                    "name": final_name,
+                    "input": {},
+                },
+            },
+        )
+        if sanitized is not None:
+            chunk += _sse(
+                Constants.EVENT_CONTENT_BLOCK_DELTA,
+                {
+                    "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                    "index": idx,
+                    "delta": {
+                        "type": Constants.DELTA_INPUT_JSON,
+                        "partial_json": sanitized,
+                    },
+                },
+            )
+        chunk += _sse(
+            Constants.EVENT_CONTENT_BLOCK_STOP,
+            {
+                "type": Constants.EVENT_CONTENT_BLOCK_STOP,
+                "index": idx,
+            },
+        )
+        stopped_blocks.add(idx)
+        estimated_output_tokens += _count_tokens_text(
+            f"{final_name} {sanitized or lifted.raw_args or '{}'}"
+        )
+        observed_tool_calls.append(
+            {
+                "tool_id": tool_id,
+                "tool_name": final_name,
+                "arguments": sanitized or lifted.raw_args or "{}",
+                "status": "lifted_inline",
+                "resolved_name": bool(name),
+            }
+        )
+        # Inline-lifted tool calls always mean the turn should end as tool_use.
+        final_stop_reason = Constants.STOP_TOOL_USE
+        logger.info(
+            f"[PROXY] Lifted inline tool call: name={final_name} resolved={bool(name)} "
+            f"args={(sanitized or lifted.raw_args or '')[:200]}"
+        )
+        return chunk
+
+    async def _process_inline_tool_calls(fragment: str):
+        """Buffer `delta.content` text; lift any complete inline tool-call sections.
+
+        Emits text before a section via _process_text_fragment, and converted
+        tool_use blocks for each complete ` ... ` span.
+        Returns (yielded_events_str, leftover_unemitted_text).
+        """
+        nonlocal inline_text_buffer, text_emitted_any, text_block_started
+        inline_text_buffer += fragment
+
+        yielded = ""
+        consumed_upto = 0  # bytes of inline_text_buffer already handed off
+        for sec in _KIMI_SECTION.finditer(inline_text_buffer):
+            section_start = sec.start()
+            # Emit prose text preceding this section as a normal text block.
+            preceding = inline_text_buffer[consumed_upto:section_start]
+            if preceding.strip():
+                events = _start_text_block()
+                if events:
+                    yielded += events
+                    text_emitted_any = True
+                yielded += _sse(
+                    Constants.EVENT_CONTENT_BLOCK_DELTA,
+                    {
+                        "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                        "index": _get_text_block_index(),
+                        "delta": {"type": Constants.DELTA_TEXT, "text": preceding},
+                    },
+                )
+            # Close the text block we may have just opened, then lift calls.
+            if text_block_started:
+                text_idx = _get_text_block_index()
+                yielded += _sse(
+                    Constants.EVENT_CONTENT_BLOCK_STOP,
+                    {
+                        "type": Constants.EVENT_CONTENT_BLOCK_STOP,
+                        "index": text_idx,
+                    },
+                )
+                stopped_blocks.add(text_idx)
+                text_block_started = False
+            for lifted in _lift_inline_tool_calls(sec.group(0)):
+                lifted_tool_calls.append(lifted)
+                yielded += _emit_lifted_tool_block(lifted)
+            consumed_upto = sec.end()
+
+        if consumed_upto:
+            # Drop the bytes we've consumed (prose + complete sections).
+            inline_text_buffer = inline_text_buffer[consumed_upto:]
+
+        leftover = ""
+        if "<|tool_calls_section_begin" in inline_text_buffer and "<|tool_calls_section_end" not in inline_text_buffer:
+            # A section is open but not yet closed: keep buffering, emit nothing.
+            return yielded, ""
+        # No pending section. Hold back a trailing suffix that could be the
+        # start of a split control-token open (e.g. "...<|tool_calls") so a
+        # partial token is not flushed as text before the next fragment
+        # completes it. Ordinary text (including a bare "<" like "</thinking>")
+        # is never held back — only a genuine prefix of a known opener is.
+        hold_n = _inline_open_prefix_len(inline_text_buffer)
+        if hold_n > 0:
+            leftover = inline_text_buffer[:-hold_n]
+            inline_text_buffer = inline_text_buffer[-hold_n:]
+            return yielded, leftover
+        leftover = inline_text_buffer
+        inline_text_buffer = ""
+        return yielded, leftover
 
     def _start_thinking_block():
         """Start a thinking content block."""
@@ -993,8 +1385,18 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                     thinking_block_index = None
                     text_block_started = False
                 estimated_output_tokens += _count_tokens_text(delta["content"])
-                async for event in _process_text_fragment(delta["content"]):
-                    yield event
+                # Inline-text tool-call lift: scan complete ` ... ` sections
+                # built up across chunks and emit them as tool_use blocks. Anything
+                # not part of a tool-call section falls through to the normal text
+                # path (preserving ` ` handling).
+                inline_events, leftover_text = await _process_inline_tool_calls(
+                    delta["content"]
+                )
+                if inline_events:
+                    yield inline_events
+                if leftover_text:
+                    async for event in _process_text_fragment(leftover_text):
+                        yield event
 
             # --- Handle tool call deltas (Fix 1: incremental partial_json) ---
             if "tool_calls" in delta and delta["tool_calls"]:
@@ -1171,6 +1573,11 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                         }
                     )
                 final_stop_reason = _map_finish_reason(finish_reason)
+                # If the lifter converted inline-text tool calls this turn, the
+                # provider's finish_reason is "stop" (text) but the client must see
+                # tool_use so it actually runs the tool.
+                if lifted_tool_calls:
+                    final_stop_reason = Constants.STOP_TOOL_USE
                 if observability_context is not None:
                     observability_context["stop_reason"] = final_stop_reason
                     observability_context["tool_calls"] = observed_tool_calls
@@ -1227,6 +1634,31 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             },
         )
         return
+
+    # --- Flush any residual inline-text buffer (inline tool-call lift) ---
+    # The stream ended before a tool-call section was closed: emit whatever
+    # complete sections exist and flush any leftover prose as text. A trailing
+    # buffered-but-unclosed section is dropped (no end token -> malformed).
+    if inline_text_buffer:
+        for sec in _KIMI_SECTION.finditer(inline_text_buffer):
+            for lifted in _lift_inline_tool_calls(sec.group(0)):
+                lifted_tool_calls.append(lifted)
+                yield _emit_lifted_tool_block(lifted)
+        leftover = _KIMI_SECTION.sub(" ", inline_text_buffer)
+        leftover = _KIMI_TOKEN_PATTERN.sub(" ", leftover).strip()
+        if leftover:
+            events = _start_text_block()
+            if events:
+                yield events
+            text_emitted_any = True
+            yield _sse(
+                Constants.EVENT_CONTENT_BLOCK_DELTA,
+                {
+                    "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                    "index": _get_text_block_index(),
+                    "delta": {"type": Constants.DELTA_TEXT, "text": leftover},
+                },
+            )
 
     # --- Flush remaining text buffer (thinking support) ---
     if text_buffer:

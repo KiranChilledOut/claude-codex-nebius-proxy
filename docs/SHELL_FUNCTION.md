@@ -10,8 +10,18 @@ The TUI installer (`./install.sh`) can automatically append the most recent vers
 | ---------------------- | -------------------------------------------- |
 | `claude`               | Direct Claude Code (subscription login)      |
 | `claude --proxy`       | Proxy mode via Nebius with session forwarder |
+| `claude --proxy --bypass` | Proxy mode, non-interactive (defaults) for agent-to-agent orchestration |
 | `claude --proxy <dir>` | Proxy mode starting in a specific directory  |
 | `claudius`             | Alias for `claude --proxy`                   |
+
+### Bypass mode (agent-to-agent)
+
+`claude --proxy --bypass [extra args]` skips the interactive session/model/
+ensemble prompts and launches immediately with defaults: session name
+`Agent2Agent`, model = the `.env` `MODEL` default (no per-session override), and
+ensemble **off**. `--bypass` must come **second**, right after `--proxy`; any
+remaining args (e.g. `--dangerously-skip-permissions`, `-p "…"`) pass straight
+through to Claude Code. Intended for orchestration where prompts would block.
 
 ### Session Forwarder
 
@@ -63,3 +73,39 @@ If you see errors like `[forwarder] request forwarding failed` inside Claude Cod
 ### Port different from 8083?
 
 Re-run `./install.sh` and enter your custom port on the API Key & Port step.
+
+### Model name in the status line isn't clickable
+
+The model name in the proxy status line is wrapped in an OSC 8 terminal hyperlink
+that opens the per-session model picker (`/dashboard/pick?session=<name>`) in your
+browser. Clicking requires a hyperlink-capable terminal (iTerm2, Kitty, WezTerm,
+Ghostty). **Terminal.app does not support OSC 8**, and tmux/SSH may strip the
+sequences — there the model still displays, it just isn't clickable.
+
+If your terminal supports hyperlinks but Claude Code doesn't render them, set
+`FORCE_HYPERLINK=1` before launching Claude Code:
+
+```bash
+export FORCE_HYPERLINK=1
+```
+
+You can also open the picker directly: `http://localhost:<port>/dashboard/pick?session=<your-session-name>`.
+
+To enable clicking, you must re-run `./install.sh` after upgrading — it refreshes
+the shell function (`NEBIUS_SESSION_NAME`) and the statusline command.
+
+### Upgrading an existing install (shell functions)
+
+When the installer sees a profile that already has the `claude`/`claudius`/`codex`/`codexius`
+shortcuts, it marks that profile `(already configured)` and **skips** it by default — so a
+re-run won't double-append. That also means an older function version won't refresh on its own.
+
+To refresh an already-configured machine, on the final step of the wizard check
+**"Reinstall (overwrite) existing shell functions"**. Each already-configured profile then
+becomes a selectable checkbox (unchecked by default); check the ones you want to refresh,
+and on **Apply & Finish** the installer backs up the rc file (to `<rc>.bak.<mtime>`) and
+replaces the old Claude+Codex function block with the current version. Re-running with the
+box checked and a profile selected is idempotent — it swaps the block in place, no duplication.
+
+You can also do it by hand: remove the `# Claude Shell Function …` block through
+`alias codexius='codex --proxy'` from each rc file, then run `./install.sh`.

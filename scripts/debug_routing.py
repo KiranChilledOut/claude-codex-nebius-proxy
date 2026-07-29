@@ -17,9 +17,7 @@ def main():
 
     # Load config
     config = Config()
-    print(f"BIG_MODEL: {config.big_model}")
-    print(f"MIDDLE_MODEL: {config.middle_model}")
-    print(f"SMALL_MODEL: {config.small_model}")
+    print(f"MODEL: {config.model}")
     print(f"VISION_MODEL: {config.vision_model}")
 
     # Create model manager

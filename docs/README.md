@@ -44,7 +44,7 @@ Manual install (if you skip the TUI):
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env
-# Edit .env: set OPENAI_API_KEY, BIG_MODEL, etc.
+# Edit .env: set OPENAI_API_KEY, MODEL, etc.
 .venv/bin/python start_proxy.py
 ```
 
@@ -60,9 +60,7 @@ OPENAI_BASE_URL="https://api.tokenfactory.nebius.com/v1"
 Common model settings:
 
 ```bash
-BIG_MODEL="moonshotai/Kimi-K2.6"
-MIDDLE_MODEL="moonshotai/Kimi-K2.6"
-SMALL_MODEL="moonshotai/Kimi-K2.6"
+MODEL="moonshotai/Kimi-K2.6"
 VISION_MODEL="Qwen/Qwen2.5-VL-72B-Instruct"
 STRIP_IMAGE_CONTEXT="true"
 ```

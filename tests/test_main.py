@@ -7,9 +7,10 @@ import os
 import httpx
 from dotenv import load_dotenv
 
-load_dotenv()
-
-if __name__ != "__main__":
+if __name__ == "__main__":
+    # Run as a standalone script: load .env eagerly for ad-hoc execution.
+    load_dotenv()
+else:
     import pytest
 
     if os.environ.get("RUN_PROXY_INTEGRATION_TESTS") != "1":
@@ -17,6 +18,10 @@ if __name__ != "__main__":
             "Integration tests are disabled by default. Set RUN_PROXY_INTEGRATION_TESTS=1 to enable.",
             allow_module_level=True,
         )
+    # Only load .env when the integration suite is enabled, so agent/test
+    # isolation (.env can flip LANGFUSE_ENABLED=true etc.) is preserved for
+    # other unit tests collected in the same run.
+    load_dotenv()
     pytestmark = pytest.mark.asyncio
 
 

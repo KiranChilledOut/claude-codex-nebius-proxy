@@ -329,9 +329,18 @@ def convert_responses_to_openai_chat(
                 messages.append(msg)
 
     # Drop leaked server-owned search calls, then make sure any malformed
-    # tool-call arguments can't 400 the whole request on replay.
+    # tool-call arguments can't 400 the whole request on replay. Compact
+    # oversized tool outputs and coalesce consecutive same-role turns so
+    # strict backends don't reject the rebuilt history.
+    from src.conversion.request_converter import (
+        _coalesce_consecutive_roles,
+        _compact_large_tool_results,
+    )
+
     messages = _strip_leaked_search_calls(messages)
     messages = _sanitize_tool_call_arguments(messages)
+    messages = _compact_large_tool_results(messages)
+    messages = _coalesce_consecutive_roles(messages)
 
     # --- Model ---
     if model_manager is not None:
@@ -355,6 +364,9 @@ def convert_responses_to_openai_chat(
         "messages": messages,
         "stream": request.stream,
     }
+    # Nebius Token Factory rejects / misbehaves on `parallel_tool_calls`;
+    # deliberately never forward it (mirage omits it for this route too).
+    # Tools and tool_choice are still sent below.
 
     # --- Tools ---
     # If the tool_ctx parsed an empty list (all tools stripped or none

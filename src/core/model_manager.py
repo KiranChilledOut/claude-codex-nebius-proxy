@@ -43,8 +43,14 @@ class ModelManager:
                             return True
         return False
 
-    def map_claude_model_to_openai(self, claude_model: str, messages=None) -> str:
-        """Map Claude model names to OpenAI model names based on BIG/SMALL pattern"""
+    def map_claude_model_to_openai(
+        self, claude_model: str, messages=None, model_override: str = None
+    ) -> str:
+        """Map Claude model names to backend model names.
+
+        Precedence: image->vision, native passthrough, per-session override,
+        then the haiku/sonnet/opus tier fallback.
+        """
 
         # If messages contain images, route to vision model
         if messages and self.contains_image_content(messages, latest_user_only=True):
@@ -61,6 +67,10 @@ class ModelManager:
             or claude_model.startswith("deepseek-")
         ):
             return claude_model
+
+        # Per-session override wins over the tier fallback.
+        if model_override:
+            return model_override
 
         # Map based on model naming patterns
         model_lower = claude_model.lower()

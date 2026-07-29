@@ -59,9 +59,7 @@ Edit the file. The values you **must** change are marked below.
 | `OPENAI_API_KEY`            | **Yes**   | Your Nebius API key from [nebius.com](https://nebius.com)                                                  |
 | `ANTHROPIC_API_KEY`         | No        | Keep as `claude-local` (proxy uses bearer auth)                                                            |
 | `OPENAI_BASE_URL`           | No        | Defaults to `https://api.tokenfactory.nebius.com/v1`                                                       |
-| `BIG_MODEL`                 | No        | Defaults to `moonshotai/Kimi-K2.6`                                                                         |
-| `MIDDLE_MODEL`              | No        | Defaults to `moonshotai/Kimi-K2.6`                                                                         |
-| `SMALL_MODEL`               | No        | Defaults to `moonshotai/Kimi-K2.6`                                                                         |
+| `MODEL`                     | No        | Backend model for all Claude tiers; defaults to `moonshotai/Kimi-K2.6`                                     |
 | `VISION_MODEL`              | No        | Defaults to `moonshotai/Kimi-K2.6`                                                                         |
 | `HOST`                      | No        | Defaults to `0.0.0.0`                                                                                      |
 | `PORT`                      | No        | Defaults to `8083`                                                                                         |

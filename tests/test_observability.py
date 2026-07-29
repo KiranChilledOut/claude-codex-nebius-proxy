@@ -105,6 +105,63 @@ async def test_observability_recorder_persists_request_and_tool_call(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_record_request_persists_langfuse_trace_id(tmp_path):
+    """The Langfuse trace id threads through record_request and surfaces in
+    fetch_requests (SELECT * exposes the column), defaulting to None when
+    absent so the dashboard can hide the deep-link."""
+    db_path = tmp_path / "observability.sqlite3"
+    recorder = ObservabilityRecorder(
+        enabled=True,
+        db_path=str(db_path),
+        queue_size=10,
+        pricing_catalog=PricingCatalog('{}'),
+        store_tool_args=False,
+    )
+    await recorder.start()
+    # One row with a trace id, one without (Langfuse was off for it).
+    common = dict(
+        started_at=utc_now_iso(),
+        started_at_unix=time.time(),
+        completed_at=utc_now_iso(),
+        base_url="https://api.tokenfactory.nebius.com/v1",
+        claude_model="claude-sonnet",
+        backend_model="model-a",
+        stream=False,
+        status="success",
+        http_status=200,
+        latency_ms=10,
+    )
+    recorder.record_request(request_id="req_with_trace", **common, langfuse_trace_id="deadbeef" * 4)
+    recorder.record_request(request_id="req_without_trace", **common, langfuse_trace_id=None)
+    await recorder.stop()
+
+    rows = {r["request_id"]: r for r in recorder.fetch_requests(limit=10)}
+    assert rows["req_with_trace"]["langfuse_trace_id"] == "deadbeef" * 4
+    assert rows["req_without_trace"]["langfuse_trace_id"] is None
+
+
+def test_observability_config_exposes_langfuse_block():
+    """The dashboard config endpoint exposes the Langfuse host + project id
+    needed to build a trace deep-link; values mirror the client's config."""
+    from fastapi.testclient import TestClient
+
+    from src.main import app
+
+    client = TestClient(app)
+    resp = client.get("/api/observability/config")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "langfuse" in body
+    lf = body["langfuse"]
+    # Mirror the LangfuseConfig contract used to build the trace URL.
+    assert {"enabled", "configured", "host", "project_id"}.issubset(lf)
+    assert isinstance(lf["enabled"], bool)
+    assert isinstance(lf["configured"], bool)
+    assert isinstance(lf["host"], str) and lf["host"]
+    assert isinstance(lf["project_id"], str)
+
+
+@pytest.mark.asyncio
 async def test_fetch_ensemble_leaderboard_aggregates_wins_and_user_picks(tmp_path):
     from src.ensemble.engine import EnsembleCandidate
 
@@ -336,3 +393,21 @@ def test_context_usage_for_returns_none_when_no_rows(tmp_path):
     with recorder._connect() as conn:
         result = recorder._context_usage_for(conn, "session_id", "nonexistent")
     assert result is None
+
+
+def test_dashboard_assets_served_and_render_trace_link():
+    """The dashboard JS includes the Langfuse trace link renderer, and the
+    static assets are served (so a live dashboard can build deep-links)."""
+    from fastapi.testclient import TestClient
+    from src.main import app
+
+    client = TestClient(app)
+    js = client.get("/dashboard/assets/dashboard.js").text
+    # The renderer + URL builder exist and gate on enabled+host+projectId+trace.
+    assert "function renderLangfuseTraceLink" in js
+    assert "function langfuseTraceUrl" in js
+    assert "/project/" in js and "/traces/" in js
+    # Never renders when any required piece is missing.
+    assert "if (!langfuseState.enabled" in js
+    html = client.get("/dashboard").text
+    assert html.count("<th>Trace</th>") == 2

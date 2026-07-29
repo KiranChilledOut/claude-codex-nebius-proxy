@@ -16,6 +16,7 @@ from src.conversion.server_tools import (
 from src.core.client import reasoning_effort_supported
 from src.core.config import config
 from src.core.constants import Constants
+from src.core.model_catalog import model_catalog
 from src.models.claude import ClaudeMessage, ClaudeMessagesRequest
 
 logger = logging.getLogger(__name__)
@@ -90,9 +91,23 @@ except Exception as e:
 # Rough per-model context limits (tokens). Used to downscale max_tokens when
 # prompts get close to the window. Configurable via env overrides in config.
 # If no override is provided, we fall back to the safe default below.
-DEFAULT_CONTEXT_LIMIT = 128000
+#
+# 200_000 matches the standard (non-1m) Claude reference window, so when the
+# real backend window is unknown, compute_usage_scale() becomes a no-op
+# (scale == 1.0) instead of amplifying reported usage. A smaller default (e.g.
+# 128K against a 200K Claude window) inflates usage ~1.56x and makes Claude
+# Code hit "context limit reached" and auto-compact far too early.
+DEFAULT_CONTEXT_LIMIT = 200000
 # Extra safety buffer beyond the reserve passed to trimming.
 TOKEN_ESTIMATE_BUFFER = 512
+
+# Tool-result compaction (mirage context-policy): a single huge tool result
+# (a big file read, a long bash dump) can dominate a session and force the
+# trimmer to amputate whole recent turns. Instead, shrink any tool result
+# over this size in place, keeping the turn. 512 tokens is mirage's
+# threshold; we keep a small head+tail so the model retains context.
+TOOL_RESULT_COMPACT_THRESHOLD = 512  # tokens
+TOOL_RESULT_COMPACT_TARGET = 384  # tokens of content kept per result
 
 
 def _get_context_limit(model_name: str) -> int:
@@ -111,7 +126,13 @@ def _get_context_limit(model_name: str) -> int:
     if model_name == config.vision_model and config.vision_model_context_limit:
         return config.vision_model_context_limit
 
-    # No prefix match; use safe default
+    catalog_len = model_catalog.get_context_length(model_name)
+    # Some providers return small placeholder values (e.g. Nebius returns 8000
+    # for models with 128K+ real windows). Ignore values below this floor.
+    if catalog_len and catalog_len >= 16384:
+        return catalog_len
+
+    # No override or implausibly small catalog value; use safe default.
     return DEFAULT_CONTEXT_LIMIT
 
 
@@ -174,11 +195,41 @@ def _client_effort(claude_request) -> Optional[str]:
     return None
 
 
+def _thinking_budget_effort(claude_request) -> Optional[str]:
+    """Map an Anthropic `thinking: {budget_tokens: N}` request to an effort.
+
+    Claude Code signals extended reasoning via thinking.budget_tokens rather
+    than output_config.effort; previously that signal was silently dropped.
+    Buckets: 0 -> off (None), < 8k -> low, < 32k -> medium, else high.
+    """
+    thinking = getattr(claude_request, "thinking", None)
+    if thinking is None:
+        return None
+    if isinstance(thinking, dict):
+        ttype = thinking.get("type")
+        budget = thinking.get("budget_tokens")
+    else:
+        ttype = getattr(thinking, "type", None)
+        budget = getattr(thinking, "budget_tokens", None)
+    if ttype is not None and str(ttype).lower() == "disabled":
+        return None
+    if not isinstance(budget, int) or budget < 1:
+        return None
+    if budget < 8192:
+        return "low"
+    if budget < 32768:
+        return "medium"
+    return "high"
+
+
 def _resolve_reasoning_effort(claude_request) -> Optional[str]:
-    """Forward the effort the user chose in Claude Code (output_config.effort)
-    to the backend as reasoning_effort — mirroring how Claude Code's /effort
-    flows through to Anthropic. Returns None when the client sent no effort."""
-    return _map_client_effort(_client_effort(claude_request))
+    """Forward the effort the user chose in Claude Code to the backend as
+    reasoning_effort. Reads output_config.effort first, then falls back to
+    thinking.budget_tokens. Returns None when the client sent no signal."""
+    effort = _map_client_effort(_client_effort(claude_request))
+    if effort:
+        return effort
+    return _thinking_budget_effort(claude_request)
 
 
 def _count_tokens_text(text: str) -> int:
@@ -187,6 +238,34 @@ def _count_tokens_text(text: str) -> int:
         return len(_tiktoken_encoding.encode(text, disallowed_special=()))
     # Fallback: chars / 4 with a conservative 1.35x bias
     return int(math.ceil(len(text) / 4 * 1.35))
+
+
+def _estimate_tools_tokens(tools) -> int:
+    """Estimate token count for Claude-format tool definitions.
+
+    Tool definitions (name + description + input_schema) are appended to the
+    backend request AFTER the prompt estimate is computed, so they must be
+    subtracted from the available context to avoid over-allocating max_tokens
+    and triggering backend context_length_exceeded errors.  Claude Code's full
+    tool set is typically 5-10k tokens.
+    """
+    if not tools:
+        return 0
+    total = 0
+    for tool in tools:
+        tname = getattr(tool, "name", None) or ""
+        tdesc = getattr(tool, "description", None) or ""
+        tschema = getattr(tool, "input_schema", None)
+        if tname:
+            total += _count_tokens_text(tname)
+        if tdesc:
+            total += _count_tokens_text(tdesc)
+        if tschema:
+            try:
+                total += _count_tokens_text(json.dumps(tschema, ensure_ascii=False))
+            except (TypeError, ValueError):
+                total += _count_tokens_text(str(tschema))
+    return total
 
 
 def _estimate_prompt_tokens(
@@ -473,8 +552,132 @@ def _trim_messages_to_fit(
     return flat, dropped
 
 
+def _truncate_to_token_budget(text: str, budget: int) -> Tuple[str, str, int]:
+    """Split `text` into head/tail around `budget` tokens.
+
+    Returns (head, tail, omitted_token_estimate). When the text already
+    fits, head == tail == text and omitted == 0."""
+    if not text:
+        return text, text, 0
+    if _tiktoken_available and _tiktoken_encoding is not None:
+        ids = _tiktoken_encoding.encode(text, disallowed_special=())
+        if len(ids) <= budget:
+            return text, text, 0
+        half = budget // 2
+        head = _tiktoken_encoding.decode(ids[:half])
+        tail = _tiktoken_encoding.decode(ids[-(budget - half):])
+        omitted = len(ids) - budget
+        return head, tail, omitted
+    # char fallback (~4 chars/token)
+    approx = len(text) // 4
+    if approx <= budget:
+        return text, text, 0
+    half = (budget * 4) // 2
+    return text[:half], text[-(budget * 4 - half):], approx - budget
+
+
+def _compact_large_tool_results(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Shrink oversized role=tool contents in place, keeping the turn.
+
+    A single huge tool result otherwise forces the trimmer to drop whole
+    recent turn-groups. The most recent message is left untouched (the
+    in-flight tool output should reach the model whole).
+    """
+    if not messages:
+        return messages
+    last_idx = len(messages) - 1
+    for i, msg in enumerate(messages):
+        if i == last_idx:
+            continue
+        if not isinstance(msg, dict) or msg.get("role") != Constants.ROLE_TOOL:
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        if _count_tokens_text(content) <= TOOL_RESULT_COMPACT_THRESHOLD:
+            continue
+        head, tail, omitted = _truncate_to_token_budget(
+            content, TOOL_RESULT_COMPACT_TARGET
+        )
+        msg["content"] = (
+            f"{head}\n[… omitted {omitted} tokens …]\n{tail}"
+        )
+    return messages
+
+
+def _coalesce_consecutive_roles(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge consecutive same-role messages (text part).
+
+    Some Token Factory models reject role-alternation violations, which
+    Claude Code can produce (consecutive user/tool turns). Merging the text
+    of adjacent same-role messages keeps strict models from 400ing. Messages
+    carrying tool_calls or role=tool are never merged — their structure is
+    significant to the backend. Content carrying a non-text block
+    (image_url, tool_result, …) is never merged either, since flattening it
+    to text would silently drop the block.
+    """
+    if not messages:
+        return messages
+    out: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        role = msg.get("role")
+        prev = out[-1] if out else None
+        if (
+            prev is not None
+            and isinstance(prev, dict)
+            and prev.get("role") == role
+            and role in (Constants.ROLE_SYSTEM, Constants.ROLE_USER, Constants.ROLE_ASSISTANT)
+            and not msg.get("tool_calls")
+            and not prev.get("tool_calls")
+            and _is_text_only(prev.get("content"))
+            and _is_text_only(msg.get("content"))
+        ):
+            ptext = _message_text(prev.get("content"))
+            ctext = _message_text(msg.get("content"))
+            merged = "\n".join(t for t in (ptext, ctext) if t)
+            prev["content"] = merged
+            continue
+        out.append(msg)
+    return out
+
+
+def _is_text_only(content: Any) -> bool:
+    """True when content can be flattened to text without losing a block.
+
+    Strings/None are always safe. A list is safe only if every block is a
+    plain text part — an image_url or tool_result block would be dropped by
+    flattening, so such content must not be merged.
+    """
+    if content is None or isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return all(
+            isinstance(block, dict) and block.get("type") == "text"
+            for block in content
+        )
+    return False
+
+
+def _message_text(content: Any) -> str:
+    """Flatten OpenAI message content to plain text for coalescing."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "\n".join(parts)
+    return str(content)
+
+
 def convert_claude_to_openai(
-    claude_request: ClaudeMessagesRequest, model_manager
+    claude_request: ClaudeMessagesRequest, model_manager, model_override: str = None
 ) -> Dict[str, Any]:
     """Convert Claude API request format to OpenAI format."""
     allow_tools = not config.disable_tools
@@ -486,7 +689,7 @@ def convert_claude_to_openai(
 
     # Map model
     openai_model = model_manager.map_claude_model_to_openai(
-        claude_request.model, claude_request.messages
+        claude_request.model, claude_request.messages, model_override=model_override
     )
     logger.info(
         f"Selected model: {openai_model} for request with {len(claude_request.messages)} messages"
@@ -601,16 +804,34 @@ def convert_claude_to_openai(
             i += 1
 
     # Build OpenAI request
-    # Context trimming + max_tokens guard
+    # Context trimming + max_tokens guard.
+    # Tools are added to the request below but are NOT part of openai_messages, so
+    # _estimate_prompt_tokens would silently miss their token cost (5-10k for Claude
+    # Code's full tool set).  Compute the overhead from the raw Claude tools now and
+    # fold it into the reserve used for both trimming and the max_tokens cap.
     context_limit = _get_context_limit(openai_model)
-    openai_messages, dropped = _trim_messages_to_fit(openai_messages, context_limit, reserve=2048)
+    tool_overhead = _estimate_tools_tokens(claude_request.tools if allow_tools else None)
+    trim_reserve = 2048 + tool_overhead
+    openai_messages, dropped = _trim_messages_to_fit(openai_messages, context_limit, reserve=trim_reserve)
     if dropped:
         logger.warning(
             f"Trimmed {dropped} oldest messages to fit context window for model {openai_model}"
         )
+    # Compact oversized tool results in place (keeps the turn), then merge
+    # consecutive same-role turns for strict models. Both are no-ops on a
+    # well-formed conversation.
+    openai_messages = _compact_large_tool_results(openai_messages)
+    openai_messages = _coalesce_consecutive_roles(openai_messages)
 
     prompt_estimate = _estimate_prompt_tokens(openai_messages)
-    available = max(context_limit - prompt_estimate - 2048, 1)
+    raw_available = context_limit - prompt_estimate - tool_overhead - 2048
+    if raw_available < config.min_tokens_limit:
+        logger.warning(
+            f"Context nearly full: limit={context_limit} prompt={prompt_estimate} "
+            f"tool_overhead={tool_overhead} raw_available={raw_available}; "
+            f"flooring to min_tokens_limit={config.min_tokens_limit}"
+        )
+    available = max(raw_available, config.min_tokens_limit)
     # Respect client intent; treat MIN_TOKENS_LIMIT as a fallback for missing/invalid
     # values instead of forcing an oversized floor.
     requested = claude_request.max_tokens
