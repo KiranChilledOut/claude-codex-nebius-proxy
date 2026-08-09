@@ -48,6 +48,45 @@ def _maybe_drop_reasoning_effort(req: Dict[str, Any], error: Exception) -> bool:
     return True
 
 
+# Models that returned a 400 because of `chat_template_kwargs`. Same contract as
+# _EFFORT_UNSUPPORTED_MODELS: once a backend rejects the passthrough, stop
+# sending it rather than repeating a call that cannot succeed.
+_CTK_UNSUPPORTED_MODELS: set = set()
+
+
+def chat_template_kwargs_supported(model: str) -> bool:
+    """False once a backend model has rejected `chat_template_kwargs`."""
+    return model not in _CTK_UNSUPPORTED_MODELS
+
+
+def _maybe_drop_chat_template_kwargs(req: Dict[str, Any], error: Exception) -> bool:
+    """If a 400 was caused by `chat_template_kwargs`, drop it (and remember the
+    model can't take it) so the caller can retry once. Returns True if dropped.
+
+    The tight-budget guard is the only thing that sets this field, and losing it
+    is strictly better than failing the request: without it the backend may
+    return empty content on a tiny budget, but with a 400 it returns nothing at
+    all. Degrade, don't fail."""
+    extra_body = req.get("extra_body") or {}
+    if "chat_template_kwargs" not in extra_body:
+        return False
+    if "chat_template_kwargs" not in str(error).lower():
+        return False
+    model = req.get("model")
+    if model:
+        _CTK_UNSUPPORTED_MODELS.add(model)
+    extra_body.pop("chat_template_kwargs", None)
+    if not extra_body:
+        req.pop("extra_body", None)
+    logger.warning(
+        "Backend rejected chat_template_kwargs for model %s; retrying without it "
+        "and disabling it for this model. Tight-budget requests to this model "
+        "may return empty content.",
+        model,
+    )
+    return True
+
+
 def _retry_after_seconds(error: Optional[Exception]) -> Optional[float]:
     """Upstream-suggested wait before retrying, from Retry-After or the
     Token-Factory-style x-ratelimit-reset-requests header (e.g. "1s", "13s").
@@ -243,6 +282,8 @@ class OpenAIClient:
                 except BadRequestError as e:
                     if _maybe_drop_reasoning_effort(request, e):
                         continue
+                    if _maybe_drop_chat_template_kwargs(request, e):
+                        continue
                     if _maybe_retrim_context(request, e):
                         continue
                     self._log_openai_error(e)
@@ -305,6 +346,8 @@ class OpenAIClient:
                     raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
                 except BadRequestError as e:
                     if _maybe_drop_reasoning_effort(stream_request, e):
+                        continue
+                    if _maybe_drop_chat_template_kwargs(stream_request, e):
                         continue
                     if _maybe_retrim_context(stream_request, e):
                         continue

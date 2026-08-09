@@ -1,13 +1,18 @@
 import base64
+import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import src.conversion.request_converter as rc
 from src.conversion.request_converter import (
     TOKEN_ESTIMATE_BUFFER,
     _estimate_prompt_tokens,
     convert_claude_to_openai,
 )
+from src.core.client import _maybe_drop_chat_template_kwargs
 from src.core.config import config
 from src.core.model_manager import model_manager
 from src.models.claude import (
@@ -240,3 +245,107 @@ def test_compute_usage_scale_maps_windows(monkeypatch):
     # Windows already aligned (within 2%) -> no scaling
     monkeypatch.setattr(config, "big_model_context_limit", 201_000)
     assert compute_usage_scale("claude-opus-4", "backend/big") == 1.0
+
+
+# --- tight-budget reasoning guard -------------------------------------------
+# Claude Code issues some requests with a very small max_tokens on the same model
+# tier as the conversation. A reasoning backend can spend that whole budget on
+# hidden reasoning and return empty visible text. The guard is opt-in, so every
+# test here sets the threshold explicitly.
+
+
+def _tight_request(max_tokens):
+    # Every request here carries an effort. Without one, _resolve_reasoning_effort
+    # returns None and "reasoning_effort" is absent whether or not the guard fires,
+    # which would make the suppression assertion below vacuous.
+    return ClaudeMessagesRequest(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=max_tokens,
+        messages=[ClaudeMessage(role="user", content="hello")],
+        output_config={"effort": "xhigh"},
+    )
+
+
+def _convert(max_tokens, threshold, monkeypatch):
+    monkeypatch.setattr(config, "tight_budget_thinking_disable_threshold", threshold)
+    return convert_claude_to_openai(_tight_request(max_tokens), model_manager)
+
+
+@pytest.mark.parametrize("env_value", [None, "", "   ", "not-an-int", "-5"])
+def test_guard_is_off_unless_explicitly_configured(env_value, monkeypatch):
+    """Unset, empty, unparseable, and negative all mean disabled, so the guard is
+    never enabled by accident. Reads the environment directly rather than the
+    ambient config object, which a developer may have configured."""
+    if env_value is None:
+        monkeypatch.delenv("THINKING_TIGHT_BUDGET_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("THINKING_TIGHT_BUDGET_THRESHOLD", env_value)
+    from src.core.config import Config
+
+    assert Config().tight_budget_thinking_disable_threshold == 0
+
+
+def test_tight_budget_suppresses_reasoning(monkeypatch):
+    req = _convert(64, 256, monkeypatch)
+    assert req["extra_body"]["chat_template_kwargs"] == {
+        "thinking": False,
+        "enable_thinking": False,
+    }
+    # xhigh would otherwise resolve to "high" -- see the control below.
+    assert "reasoning_effort" not in req
+
+
+def test_normal_budget_leaves_reasoning_alone(monkeypatch):
+    """Control for the suppression test: same request, budget above the
+    threshold, effort forwarded as normal."""
+    req = _convert(4096, 256, monkeypatch)
+    assert "chat_template_kwargs" not in req.get("extra_body", {})
+    assert req["reasoning_effort"] == "high"
+
+
+def test_threshold_zero_disables_the_guard(monkeypatch):
+    req = _convert(8, 0, monkeypatch)
+    assert "chat_template_kwargs" not in req.get("extra_body", {})
+
+
+def test_guard_fires_exactly_below_the_threshold(monkeypatch):
+    assert "chat_template_kwargs" in _convert(255, 256, monkeypatch).get("extra_body", {})
+    assert "chat_template_kwargs" not in _convert(256, 256, monkeypatch).get("extra_body", {})
+
+
+def test_guard_skipped_for_model_that_rejected_the_kwarg(monkeypatch):
+    """A model that already 400'd on the passthrough stops receiving it."""
+    monkeypatch.setattr(rc, "chat_template_kwargs_supported", lambda m: False)
+    assert "chat_template_kwargs" not in _convert(64, 256, monkeypatch).get("extra_body", {})
+
+
+# --- the drop-and-retry helper ----------------------------------------------
+# Degrade rather than fail: a backend that rejects the passthrough should lose
+# the field and keep the request, not lose the request.
+
+
+def test_drop_helper_removes_only_the_kwarg_and_keeps_siblings():
+    req = {
+        "model": "some/model-a",
+        "extra_body": {"chat_template_kwargs": {"thinking": False}, "top_k": 40},
+    }
+    assert _maybe_drop_chat_template_kwargs(req, Exception("400: chat_template_kwargs unsupported"))
+    assert "chat_template_kwargs" not in req["extra_body"]
+    assert req["extra_body"]["top_k"] == 40, "sibling extra_body fields must survive"
+
+
+def test_drop_helper_ignores_an_unrelated_400():
+    req = {"model": "some/model-b", "extra_body": {"chat_template_kwargs": {"thinking": False}}}
+    before = json.loads(json.dumps(req))
+    assert not _maybe_drop_chat_template_kwargs(req, Exception("400: context length exceeded"))
+    assert req == before, "an unrelated 400 must leave the request untouched"
+
+
+def test_drop_helper_remembers_the_model():
+    from src.core.client import chat_template_kwargs_supported
+
+    req = {"model": "some/model-c", "extra_body": {"chat_template_kwargs": {"thinking": False}}}
+    assert chat_template_kwargs_supported("some/model-c")
+    _maybe_drop_chat_template_kwargs(req, Exception("400: chat_template_kwargs not allowed"))
+    assert not chat_template_kwargs_supported("some/model-c")
+    assert req.get("extra_body") is None or "chat_template_kwargs" not in req["extra_body"]

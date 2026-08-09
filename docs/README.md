@@ -99,6 +99,8 @@ Models that emit hidden reasoning tokens before visible output. Keep `MAX_TOKENS
 
 If a reasoning model returns empty text with a non-zero `output_tokens` count, the budget was exhausted by hidden reasoning — raise the limit and retry.
 
+When the small budget comes from the client rather than from config, there is no limit for an operator to raise. `THINKING_TIGHT_BUDGET_THRESHOLD` covers that case: below that effective budget the proxy suppresses reasoning for the single request, leaving the requested `max_tokens` untouched. It is `0` (disabled) by default; `256` is a useful starting point for a backend that shows this behaviour.
+
 ## Using with Claude Code
 
 Wire the proxy to Claude Code via environment variables. Prefer `ANTHROPIC_AUTH_TOKEN` over `ANTHROPIC_API_KEY` to avoid auth-conflict warnings in Claude Code.
