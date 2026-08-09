@@ -13,7 +13,7 @@ from src.conversion.server_tools import (
     SEARCH_TOOL_SYSTEM_SUPPLEMENT,
     is_search_tool,
 )
-from src.core.client import reasoning_effort_supported
+from src.core.client import chat_template_kwargs_supported, reasoning_effort_supported
 from src.core.config import config
 from src.core.constants import Constants
 from src.models.claude import ClaudeMessage, ClaudeMessagesRequest
@@ -626,10 +626,39 @@ def convert_claude_to_openai(
         "temperature": claude_request.temperature,
         "stream": claude_request.stream,
     }
+    # Tight-budget guard: a request-scoped reasoning suppression for budgets too
+    # small to hold both a chain of thought and an answer. See
+    # config.tight_budget_thinking_disable_threshold for the failure it prevents.
+    #
+    # Two levers are needed because backends take reasoning instruction two
+    # different ways, and this proxy can face either at once:
+    #   - reasoning_effort, the OpenAI-style parameter upstream already forwards
+    #   - chat_template_kwargs.thinking / .enable_thinking, the vLLM-style
+    #     passthrough that Nebius Token Factory models read (the field name
+    #     differs per model family, so both spellings are sent)
+    # Forwarding an effort while telling the template not to think is
+    # self-contradictory, so the guard suppresses the parameter rather than
+    # layering the kwarg on top of it.
+    tight_budget = (
+        config.tight_budget_thinking_disable_threshold > 0
+        and safe_max_tokens < config.tight_budget_thinking_disable_threshold
+    )
+
     # Opt-in reasoning passthrough so reasoning-capable backends actually think.
     reasoning_effort = _resolve_reasoning_effort(claude_request)
-    if reasoning_effort and reasoning_effort_supported(openai_model):
+    if reasoning_effort and reasoning_effort_supported(openai_model) and not tight_budget:
         openai_request["reasoning_effort"] = reasoning_effort
+
+    if tight_budget:
+        logger.info(
+            "[TIGHTBUDGET] suppressing reasoning for this request only: "
+            f"max_tokens={safe_max_tokens} < threshold="
+            f"{config.tight_budget_thinking_disable_threshold} model={openai_model}"
+        )
+        if chat_template_kwargs_supported(openai_model):
+            ctk = openai_request.setdefault("extra_body", {}).setdefault("chat_template_kwargs", {})
+            ctk.setdefault("thinking", False)
+            ctk.setdefault("enable_thinking", False)
     logger.debug(
         f"Converted Claude request to OpenAI format: {json.dumps(openai_request, indent=2, ensure_ascii=False)}"
     )

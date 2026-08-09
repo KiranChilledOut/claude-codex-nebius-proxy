@@ -28,6 +28,25 @@ class Config:
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
         self.max_tokens_limit = int(os.environ.get("MAX_TOKENS_LIMIT", "4096"))
         self.min_tokens_limit = int(os.environ.get("MIN_TOKENS_LIMIT", "100"))
+
+        # Tight-budget reasoning guard. Claude Code issues some requests with a
+        # very small max_tokens on the same model tier as the main conversation,
+        # not on the small tier. A reasoning-capable backend can spend that whole
+        # budget on hidden reasoning and return empty visible text. Below this
+        # many tokens, reasoning is suppressed for THAT REQUEST ONLY.
+        #
+        # Disabled by default. The behaviour is backend-specific, and enabling it
+        # globally would change output for every routed model. 256 is a useful
+        # starting point for a backend that shows the failure. Any unset, empty,
+        # or unparseable value means disabled, so the guard is never on by
+        # accident.
+        _tight_raw = os.environ.get("THINKING_TIGHT_BUDGET_THRESHOLD", "").strip()
+        try:
+            self.tight_budget_thinking_disable_threshold = int(_tight_raw) if _tight_raw else 0
+        except ValueError:
+            self.tight_budget_thinking_disable_threshold = 0
+        if self.tight_budget_thinking_disable_threshold < 0:
+            self.tight_budget_thinking_disable_threshold = 0
         # Optional explicit model context limits (tokens). If not set, code falls back to baked-in defaults.
         self.big_model_context_limit = int(os.environ.get("BIG_MODEL_CONTEXT_LIMIT", "0") or 0)
         self.middle_model_context_limit = int(
